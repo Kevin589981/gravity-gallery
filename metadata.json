@@ -1,0 +1,5 @@
+{
+  "name": "Gravity Gallery",
+  "description": "A mobile-first web gallery application that cycles through local folders. Features gravity-based image rotation, customizable intervals, and touch-optimized controls.",
+  "requestFramePermissions": []
+}
