@@ -156,12 +156,12 @@ async def get_playlist(req: PlaylistRequest):
     # 方向筛选
     if req.orientation == 'Landscape':
         query += " AND is_landscape = 1"
-        print("Landscape")
+        # print("Landscape")
     elif req.orientation == 'Portrait':
         query += " AND is_landscape = 0"
-        print("Portrait")
-    else:
-        print("both")
+        # print("Portrait")
+    # else:
+    #     print("both")
     
     # 执行查询
     with get_db() as conn:
@@ -230,5 +230,5 @@ if __name__ == "__main__":
         return IP
 
     ip = get_ip()
-    print(f"\n🚀 数据库增强版服务器已启动: http://{ip}:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    print(f"\n🚀 数据库增强版服务器已启动: http://{ip}:4860")
+    uvicorn.run(app, host="0.0.0.0", port=4860)

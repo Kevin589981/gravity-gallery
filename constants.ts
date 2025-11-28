@@ -10,6 +10,6 @@ export const DEFAULT_CONFIG: AppConfig = {
 };
 
 // You can change this IP to match your computer's local IP
-export const DEFAULT_SERVER_URL = 'http://<ip>:8000';
+export const DEFAULT_SERVER_URL = 'http://<ip>:4860';
 
 export const SUPPORTED_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg'];
