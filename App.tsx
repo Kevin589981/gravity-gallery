@@ -23,9 +23,10 @@ const App: React.FC = () => {
 
     const uiTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-    
-    // 【修改点 1】新增：用于同步跟踪正在预加载的图片ID，防止重复请求
     const preloadInProgress = useRef<Set<string>>(new Set());
+    
+    // 用于防止在设置更改时 useEffect 多次触发 fetch
+    const fetchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     // Persistence: Load on mount
     useEffect(() => {
@@ -34,63 +35,67 @@ const App: React.FC = () => {
             try {
                 const parsed = JSON.parse(saved);
                 if (parsed.config) setConfig(parsed.config);
-
-                // Auto-connect if server info exists
                 if (parsed.config?.serverUrl && parsed.config?.selectedServerPaths) {
                     fetchServerPlaylist(
                         parsed.config.serverUrl,
                         parsed.config.selectedServerPaths,
                         parsed.config.sortMode,
                         parsed.config.sortDirection,
-                        parsed.config.orientationFilter
+                        parsed.config.orientationFilter,
+                        null
                     );
                 }
-            } catch (e) {
-                console.error("Failed to load saved state", e);
-            }
+            } catch (e) { console.error("Failed to load saved state", e); }
         }
     }, []);
 
     // Persistence: Save on change
     useEffect(() => {
         if (config.serverUrl) {
-            const stateToSave = {
-                config: config
-            };
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToSave));
+            localStorage.setItem(STORAGE_KEY, JSON.stringify({ config }));
         }
     }, [config]);
 
-    // --- SERVER FETCH LOGIC ---
+    // --- SERVER FETCH LOGIC (triggered by config changes) ---
     useEffect(() => {
-        if (isLoading) return;
+        // Debounce fetch calls
+        if (fetchDebounceRef.current) clearTimeout(fetchDebounceRef.current);
+        
+        fetchDebounceRef.current = setTimeout(() => {
+            if (isLoading) return;
 
-        if (config.serverUrl && config.selectedServerPaths) {
-            fetchServerPlaylist(
-                config.serverUrl,
-                config.selectedServerPaths,
-                config.sortMode,
-                config.sortDirection,
-                config.orientationFilter
-            );
-        } else if (!config.serverUrl) {
-            // Local Mode Logic - Apply sorting locally
-            if (config.sortMode === SortMode.Shuffle) {
-                setAllImages(prev => shuffleArray(prev));
-                setCurrentIndex(0);
-            } else if (config.sortMode === SortMode.Sequential) {
-                setAllImages(prev => [...prev].sort((a, b) => naturalSort(a.name, b.name)));
+            if (config.serverUrl && config.selectedServerPaths) {
+                const currentImagePath = allImages.length > 0 ? allImages[currentIndex]?.id : null;
+                fetchServerPlaylist(
+                    config.serverUrl,
+                    config.selectedServerPaths,
+                    config.sortMode,
+                    config.sortDirection,
+                    config.orientationFilter,
+                    currentImagePath
+                );
+            } else if (!config.serverUrl) {
+                // Local Mode Logic
+                let sorted = [...allImages];
+                if (config.sortMode === SortMode.Shuffle) {
+                    sorted = shuffleArray(sorted);
+                } else {
+                    sorted = sorted.sort((a, b) => naturalSort(a.name, b.name));
+                }
+                if (config.sortDirection === SortDirection.Reverse) {
+                    sorted.reverse();
+                }
+                setAllImages(sorted);
                 setCurrentIndex(0);
             }
-            if (config.sortDirection === SortDirection.Reverse) {
-                setAllImages(prev => [...prev].reverse());
-                setCurrentIndex(0);
-            }
-        }
+        }, 300); // 300ms debounce
+
+        return () => {
+            if (fetchDebounceRef.current) clearTimeout(fetchDebounceRef.current);
+        };
     }, [config.sortMode, config.sortDirection, config.orientationFilter]);
 
-
-    // --- 【修改点 2】Preload Logic 修复竞态条件 ---
+    // --- Preload Logic ---
     useEffect(() => {
         if (allImages.length === 0) return;
 
@@ -98,10 +103,7 @@ const App: React.FC = () => {
         for (let i = 1; i <= PRELOAD_BATCH_SIZE; i++) {
             const nextIdx = (currentIndex + i) % allImages.length;
             const img = allImages[nextIdx];
-            
-            // 核心修改：增加 check "preloadInProgress.current.has(img.id)"
-            // 只有当图片未加载且当前也没有正在加载时，才推入队列
-            if (img && !img.file && !img.dimsLoaded && !img.blobUrl && !preloadInProgress.current.has(img.id)) {
+            if (img && !img.blobUrl && !preloadInProgress.current.has(img.id)) {
                 indicesToPreload.push(nextIdx);
             }
         }
@@ -111,83 +113,33 @@ const App: React.FC = () => {
         indicesToPreload.forEach(async (idx) => {
             const img = allImages[idx];
             if (!img) return;
-
-            // 立即标记为正在处理
             preloadInProgress.current.add(img.id);
-
             try {
                 const { blobUrl, isLandscape } = await preloadImageAsBlob(img.url);
-
                 setAllImages(prev => {
                     const newArr = [...prev];
-                    // Check if the image at this index is still the same
                     if (newArr[idx] && newArr[idx].id === img.id) {
-                        newArr[idx] = {
-                            ...newArr[idx],
-                            blobUrl,
-                            isLandscape,
-                            dimsLoaded: true
-                        };
+                        newArr[idx] = { ...newArr[idx], blobUrl, isLandscape, dimsLoaded: true };
                     }
                     return newArr;
                 });
-                // 成功后无需立即从 Set 移除，因为 state 中已有 blobUrl 会阻挡下一次请求
             } catch (e) {
-                // 失败时移除标记，以便后续（如下一轮循环或重试机制）可以再次尝试
                 preloadInProgress.current.delete(img.id);
             }
         });
-    }, [currentIndex, allImages.length]); // 依赖项保持不变，实际内容由 allImages[idx] 获取
+    }, [currentIndex, allImages]);
 
-    // Handle Folder Selection (Local Mode)
-    const handleFolderSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-        if (e.target.files && e.target.files.length > 0) {
-            setIsLoading(true);
-            
-            // 【修改点 3】清理旧的加载标记
-            preloadInProgress.current.clear();
 
-            const fileList = Array.from(e.target.files);
-            const validFiles = fileList.filter(isImageFile);
-
-            if (validFiles.length === 0) {
-                alert("No images found in this folder.");
-                setIsLoading(false);
-                return;
-            }
-
-            const processedImages = await Promise.all(validFiles.map(createImageObject));
-            let sorted = processedImages;
-
-            if (config.sortMode === SortMode.Shuffle) {
-                sorted = shuffleArray(processedImages);
-            } else {
-                sorted = processedImages.sort((a, b) => naturalSort(a.name, b.name));
-            }
-
-            if (config.sortDirection === SortDirection.Reverse) {
-                sorted = sorted.reverse();
-            }
-
-            setAllImages(sorted);
-            setConfig(prev => ({ ...prev, serverUrl: undefined, selectedServerPaths: undefined }));
-            setCurrentIndex(0);
-            setNoMatchesFound(false);
-            setIsLoading(false);
-            setIsUIOpen(true);
-            resetUITimer();
-        }
-    };
-
+    // --- Core Functions ---
     const fetchServerPlaylist = async (
         url: string,
         paths: string[],
         sort: SortMode,
         direction: SortDirection,
-        orientation: OrientationFilter
+        orientation: OrientationFilter,
+        currentPath: string | null
     ) => {
         setIsLoading(true);
-        // 【修改点 3】清理旧的加载标记
         preloadInProgress.current.clear();
 
         try {
@@ -199,17 +151,21 @@ const App: React.FC = () => {
             else if (sort === SortMode.Date) sortStr = 'date';
             else if (sort === SortMode.SubfolderRandom) sortStr = 'subfolder_random';
             else if (sort === SortMode.SubfolderDate) sortStr = 'subfolder_date';
-            else sortStr = 'name';
+            
+            const body: any = {
+                paths,
+                sort: sortStr,
+                direction: direction.toLowerCase(),
+                orientation,
+            };
+            if (currentPath) {
+                body.current_path = currentPath;
+            }
 
             const res = await fetch(api, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    paths: paths,
-                    sort: sortStr,
-                    direction: direction.toLowerCase(),
-                    orientation: orientation
-                })
+                body: JSON.stringify(body)
             });
 
             if (!res.ok) throw new Error("Failed to get playlist");
@@ -219,24 +175,18 @@ const App: React.FC = () => {
                 setAllImages([]);
                 setNoMatchesFound(true);
             } else {
-                const imageObjects = relPaths.map(relPath => {
-                    const fullUrl = `${base}/${relPath}`;
-                    return {
-                        id: relPath,
-                        url: fullUrl,
-                        name: relPath.split('/').pop() || 'Image',
-                        isLandscape: false
-                    };
-                });
-
+                const imageObjects = relPaths.map(relPath => ({
+                    id: relPath,
+                    url: `${base}/${relPath}`,
+                    name: relPath.split('/').pop() || 'Image',
+                    isLandscape: false
+                }));
                 setAllImages(imageObjects);
                 setCurrentIndex(0);
                 setNoMatchesFound(false);
             }
-
             setIsUIOpen(true);
             resetUITimer();
-
         } catch (e: any) {
             console.error(e);
             alert("Failed to connect to server or load playlist.");
@@ -245,23 +195,41 @@ const App: React.FC = () => {
         }
     };
 
+    const handleFolderSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        if (!e.target.files || e.target.files.length === 0) return;
+        setIsLoading(true);
+        preloadInProgress.current.clear();
+
+        const validFiles = Array.from(e.target.files).filter(isImageFile);
+        if (validFiles.length === 0) {
+            alert("No images found in this folder.");
+            setIsLoading(false); return;
+        }
+
+        const processedImages = await Promise.all(validFiles.map(createImageObject));
+        let sorted = processedImages.sort((a, b) => naturalSort(a.name, b.name));
+        if (config.sortMode === SortMode.Shuffle) sorted = shuffleArray(processedImages);
+        if (config.sortDirection === SortDirection.Reverse) sorted.reverse();
+
+        setAllImages(sorted);
+        setConfig(prev => ({ ...prev, serverUrl: undefined, selectedServerPaths: undefined }));
+        setCurrentIndex(0);
+        setNoMatchesFound(false);
+        setIsLoading(false);
+        setIsUIOpen(true);
+        resetUITimer();
+    };
+    
     const handleServerStart = (url: string, paths: string[]) => {
         setConfig(prev => ({ ...prev, serverUrl: url, selectedServerPaths: paths }));
-        fetchServerPlaylist(url, paths, config.sortMode, config.sortDirection, config.orientationFilter);
+        // Initial fetch has no current path
+        fetchServerPlaylist(url, paths, config.sortMode, config.sortDirection, config.orientationFilter, null);
     };
 
     const loadDemoImages = async () => {
         setIsLoading(true);
-        // 【修改点 3】清理旧的加载标记
         preloadInProgress.current.clear();
-
-        const demoUrls = [
-            'https://picsum.photos/1920/1080',
-            'https://picsum.photos/1080/1920',
-            'https://picsum.photos/2000/3000',
-            'https://picsum.photos/3000/2000',
-            'https://picsum.photos/1500/1500',
-        ];
+        const demoUrls = ['https://picsum.photos/1920/1080', 'https://picsum.photos/1080/1920', 'https://picsum.photos/2000/3000', 'https://picsum.photos/3000/2000', 'https://picsum.photos/1500/1500'];
         const processed = await Promise.all(demoUrls.map((u, i) => createImageObject(`${u}?r=${i}`)));
         setAllImages(shuffleArray(processed));
         setConfig(prev => ({ ...prev, serverUrl: undefined, selectedServerPaths: undefined }));
@@ -274,12 +242,12 @@ const App: React.FC = () => {
 
     const nextImage = useCallback(() => {
         if (allImages.length === 0) return;
-        setCurrentIndex((prev) => (prev + 1) % allImages.length);
+        setCurrentIndex(prev => (prev + 1) % allImages.length);
     }, [allImages.length]);
 
     const prevImage = useCallback(() => {
         if (allImages.length === 0) return;
-        setCurrentIndex((prev) => (prev - 1 + allImages.length) % allImages.length);
+        setCurrentIndex(prev => (prev - 1 + allImages.length) % allImages.length);
     }, [allImages.length]);
 
     // Timer Logic
@@ -288,14 +256,8 @@ const App: React.FC = () => {
             if (intervalRef.current) clearInterval(intervalRef.current);
             return;
         }
-
-        intervalRef.current = setInterval(() => {
-            nextImage();
-        }, config.refreshInterval * 1000);
-
-        return () => {
-            if (intervalRef.current) clearInterval(intervalRef.current);
-        };
+        intervalRef.current = setInterval(nextImage, config.refreshInterval * 1000);
+        return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
     }, [isPaused, allImages.length, config.refreshInterval, nextImage, showSettings, noMatchesFound]);
 
     const resetUITimer = useCallback(() => {
@@ -307,10 +269,7 @@ const App: React.FC = () => {
         }, 3000);
     }, [showSettings]);
 
-    const handleScreenTap = () => {
-        resetUITimer();
-    };
-
+    // --- Render Logic ---
     if (isLoading) {
         return (
             <div className="h-screen w-screen bg-black flex flex-col items-center justify-center space-y-4">
@@ -321,22 +280,14 @@ const App: React.FC = () => {
     }
 
     if (allImages.length === 0 && !noMatchesFound) {
-        return (
-            <Landing
-                onFolderSelect={handleFolderSelect}
-                onServerConnectAndPlay={handleServerStart}
-                onLoadDemo={loadDemoImages}
-                initialServerUrl={config.serverUrl}
-            />
-        );
+        return <Landing onFolderSelect={handleFolderSelect} onServerConnectAndPlay={handleServerStart} onLoadDemo={loadDemoImages} initialServerUrl={config.serverUrl} />;
     }
 
-    const safeIndex = currentIndex >= allImages.length ? 0 : currentIndex;
-    const currentImage = allImages[safeIndex];
+    const currentImage = allImages[currentIndex] || allImages[0];
 
     if (noMatchesFound) {
         return (
-            <div className="h-screen w-screen bg-black flex flex-col items-center justify-center space-y-6 p-6 text-center">
+            <div className="h-screen w-screen bg-black flex flex-col items-center justify-center text-center p-6 space-y-6">
                 <div className="w-16 h-16 bg-neutral-800 rounded-full flex items-center justify-center">
                     <Icons.FilterX className="w-8 h-8 text-neutral-400" />
                 </div>
@@ -344,27 +295,9 @@ const App: React.FC = () => {
                     <h2 className="text-xl font-bold text-white">No Images Found</h2>
                     <p className="text-neutral-400 mt-2">The current filter returned no results.</p>
                 </div>
-                <button
-                    onClick={() => setShowSettings(true)}
-                    className="bg-blue-600 px-6 py-3 rounded-xl font-bold text-white hover:bg-blue-500 transition-colors"
-                >
-                    Open Settings
-                </button>
-
-                <SettingsModal
-                    isOpen={showSettings}
-                    onClose={() => {
-                        setShowSettings(false);
-                    }}
-                    config={config}
-                    onConfigChange={setConfig}
-                    fileCount={allImages.length}
-                    onReselectFolder={() => { 
-                        setAllImages([]); 
-                        setShowSettings(false); 
-                        localStorage.removeItem(STORAGE_KEY);
-                        preloadInProgress.current.clear(); // 【修改点 3】清空 Set
-                    }}
+                <button onClick={() => setShowSettings(true)} className="bg-blue-600 px-6 py-3 rounded-xl font-bold text-white hover:bg-blue-500 transition-colors">Open Settings</button>
+                <SettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} config={config} onConfigChange={setConfig} fileCount={allImages.length}
+                    onReselectFolder={() => { setAllImages([]); setShowSettings(false); localStorage.removeItem(STORAGE_KEY); preloadInProgress.current.clear(); }}
                 />
             </div>
         )
@@ -372,36 +305,10 @@ const App: React.FC = () => {
 
     return (
         <div className="relative h-screen w-screen overflow-hidden bg-black">
-            <GalleryView
-                image={currentImage}
-                config={config}
-                isPaused={isPaused}
-                onNext={() => { nextImage(); resetUITimer(); }}
-                onPrev={() => { prevImage(); resetUITimer(); }}
-                onTap={handleScreenTap}
-            />
-
-            <ControlPanel
-                visible={isUIOpen}
-                isPaused={isPaused}
-                onTogglePause={() => { setIsPaused(!isPaused); resetUITimer(); }}
-                onNext={() => { nextImage(); resetUITimer(); }}
-                onPrev={() => { prevImage(); resetUITimer(); }}
-                onSettings={() => { setShowSettings(true); setIsPaused(true); }}
-            />
-
-            <SettingsModal
-                isOpen={showSettings}
-                onClose={() => { setShowSettings(false); setIsPaused(false); resetUITimer(); }}
-                config={config}
-                onConfigChange={setConfig}
-                fileCount={allImages.length}
-                onReselectFolder={() => { 
-                    setAllImages([]); 
-                    setShowSettings(false); 
-                    localStorage.removeItem(STORAGE_KEY);
-                    preloadInProgress.current.clear(); // 【修改点 3】清空 Set
-                }}
+            <GalleryView image={currentImage} config={config} isPaused={isPaused} onNext={() => { nextImage(); resetUITimer(); }} onPrev={() => { prevImage(); resetUITimer(); }} onTap={resetUITimer} />
+            <ControlPanel visible={isUIOpen} isPaused={isPaused} onTogglePause={() => { setIsPaused(!isPaused); resetUITimer(); }} onNext={() => { nextImage(); resetUITimer(); }} onPrev={() => { prevImage(); resetUITimer(); }} onSettings={() => { setShowSettings(true); setIsPaused(true); }} />
+            <SettingsModal isOpen={showSettings} onClose={() => { setShowSettings(false); setIsPaused(false); resetUITimer(); }} config={config} onConfigChange={setConfig} fileCount={allImages.length}
+                onReselectFolder={() => { setAllImages([]); setShowSettings(false); localStorage.removeItem(STORAGE_KEY); preloadInProgress.current.clear(); }}
             />
         </div>
     );
