@@ -23,6 +23,9 @@ const App: React.FC = () => {
 
     const uiTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+    
+    // 【修改点 1】新增：用于同步跟踪正在预加载的图片ID，防止重复请求
+    const preloadInProgress = useRef<Set<string>>(new Set());
 
     // Persistence: Load on mount
     useEffect(() => {
@@ -59,7 +62,6 @@ const App: React.FC = () => {
     }, [config]);
 
     // --- SERVER FETCH LOGIC ---
-    // Re-fetch playlist when Sort Mode, Sort Direction OR Orientation Filter changes
     useEffect(() => {
         if (isLoading) return;
 
@@ -77,11 +79,9 @@ const App: React.FC = () => {
                 setAllImages(prev => shuffleArray(prev));
                 setCurrentIndex(0);
             } else if (config.sortMode === SortMode.Sequential) {
-                // Use natural sort
                 setAllImages(prev => [...prev].sort((a, b) => naturalSort(a.name, b.name)));
                 setCurrentIndex(0);
             }
-            // Apply direction
             if (config.sortDirection === SortDirection.Reverse) {
                 setAllImages(prev => [...prev].reverse());
                 setCurrentIndex(0);
@@ -90,7 +90,7 @@ const App: React.FC = () => {
     }, [config.sortMode, config.sortDirection, config.orientationFilter]);
 
 
-    // --- Preload Logic ---
+    // --- 【修改点 2】Preload Logic 修复竞态条件 ---
     useEffect(() => {
         if (allImages.length === 0) return;
 
@@ -98,8 +98,10 @@ const App: React.FC = () => {
         for (let i = 1; i <= PRELOAD_BATCH_SIZE; i++) {
             const nextIdx = (currentIndex + i) % allImages.length;
             const img = allImages[nextIdx];
-            // Only preload remote images that haven't been loaded yet
-            if (img && !img.file && !img.dimsLoaded && !img.blobUrl) {
+            
+            // 核心修改：增加 check "preloadInProgress.current.has(img.id)"
+            // 只有当图片未加载且当前也没有正在加载时，才推入队列
+            if (img && !img.file && !img.dimsLoaded && !img.blobUrl && !preloadInProgress.current.has(img.id)) {
                 indicesToPreload.push(nextIdx);
             }
         }
@@ -110,13 +112,15 @@ const App: React.FC = () => {
             const img = allImages[idx];
             if (!img) return;
 
+            // 立即标记为正在处理
+            preloadInProgress.current.add(img.id);
+
             try {
                 const { blobUrl, isLandscape } = await preloadImageAsBlob(img.url);
 
-                // Update state with cached blob and dimension info
                 setAllImages(prev => {
                     const newArr = [...prev];
-                    // Check if the image at this index is still the same (array might have been reshuffled)
+                    // Check if the image at this index is still the same
                     if (newArr[idx] && newArr[idx].id === img.id) {
                         newArr[idx] = {
                             ...newArr[idx],
@@ -127,16 +131,22 @@ const App: React.FC = () => {
                     }
                     return newArr;
                 });
+                // 成功后无需立即从 Set 移除，因为 state 中已有 blobUrl 会阻挡下一次请求
             } catch (e) {
-                // Silently fail preloading
+                // 失败时移除标记，以便后续（如下一轮循环或重试机制）可以再次尝试
+                preloadInProgress.current.delete(img.id);
             }
         });
-    }, [currentIndex, allImages.length]);
+    }, [currentIndex, allImages.length]); // 依赖项保持不变，实际内容由 allImages[idx] 获取
 
     // Handle Folder Selection (Local Mode)
     const handleFolderSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
         if (e.target.files && e.target.files.length > 0) {
             setIsLoading(true);
+            
+            // 【修改点 3】清理旧的加载标记
+            preloadInProgress.current.clear();
+
             const fileList = Array.from(e.target.files);
             const validFiles = fileList.filter(isImageFile);
 
@@ -149,14 +159,12 @@ const App: React.FC = () => {
             const processedImages = await Promise.all(validFiles.map(createImageObject));
             let sorted = processedImages;
 
-            // Apply sorting
             if (config.sortMode === SortMode.Shuffle) {
                 sorted = shuffleArray(processedImages);
             } else {
                 sorted = processedImages.sort((a, b) => naturalSort(a.name, b.name));
             }
 
-            // Apply direction
             if (config.sortDirection === SortDirection.Reverse) {
                 sorted = sorted.reverse();
             }
@@ -179,27 +187,28 @@ const App: React.FC = () => {
         orientation: OrientationFilter
     ) => {
         setIsLoading(true);
+        // 【修改点 3】清理旧的加载标记
+        preloadInProgress.current.clear();
+
         try {
             const base = url.endsWith('/') ? url.slice(0, -1) : url;
             const api = `${base}/api/playlist`;
 
-            // Map SortMode to backend sort string
             let sortStr = 'name';
             if (sort === SortMode.Shuffle) sortStr = 'shuffle';
             else if (sort === SortMode.Date) sortStr = 'date';
             else if (sort === SortMode.SubfolderRandom) sortStr = 'subfolder_random';
             else if (sort === SortMode.SubfolderDate) sortStr = 'subfolder_date';
-            else sortStr = 'name'; // Sequential uses natural sort by name
+            else sortStr = 'name';
 
-            // Send request to backend with all filter parameters
             const res = await fetch(api, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     paths: paths,
                     sort: sortStr,
-                    direction: direction.toLowerCase(), // 'forward' or 'reverse'
-                    orientation: orientation // Backend now handles this!
+                    direction: direction.toLowerCase(),
+                    orientation: orientation
                 })
             });
 
@@ -208,7 +217,7 @@ const App: React.FC = () => {
 
             if (relPaths.length === 0) {
                 setAllImages([]);
-                setNoMatchesFound(true); // Backend says no matches
+                setNoMatchesFound(true);
             } else {
                 const imageObjects = relPaths.map(relPath => {
                     const fullUrl = `${base}/${relPath}`;
@@ -216,7 +225,7 @@ const App: React.FC = () => {
                         id: relPath,
                         url: fullUrl,
                         name: relPath.split('/').pop() || 'Image',
-                        isLandscape: false // Will be updated by preloader
+                        isLandscape: false
                     };
                 });
 
@@ -243,6 +252,9 @@ const App: React.FC = () => {
 
     const loadDemoImages = async () => {
         setIsLoading(true);
+        // 【修改点 3】清理旧的加载标记
+        preloadInProgress.current.clear();
+
         const demoUrls = [
             'https://picsum.photos/1920/1080',
             'https://picsum.photos/1080/1920',
@@ -347,7 +359,12 @@ const App: React.FC = () => {
                     config={config}
                     onConfigChange={setConfig}
                     fileCount={allImages.length}
-                    onReselectFolder={() => { setAllImages([]); setShowSettings(false); localStorage.removeItem(STORAGE_KEY); }}
+                    onReselectFolder={() => { 
+                        setAllImages([]); 
+                        setShowSettings(false); 
+                        localStorage.removeItem(STORAGE_KEY);
+                        preloadInProgress.current.clear(); // 【修改点 3】清空 Set
+                    }}
                 />
             </div>
         )
@@ -379,7 +396,12 @@ const App: React.FC = () => {
                 config={config}
                 onConfigChange={setConfig}
                 fileCount={allImages.length}
-                onReselectFolder={() => { setAllImages([]); setShowSettings(false); localStorage.removeItem(STORAGE_KEY); }}
+                onReselectFolder={() => { 
+                    setAllImages([]); 
+                    setShowSettings(false); 
+                    localStorage.removeItem(STORAGE_KEY);
+                    preloadInProgress.current.clear(); // 【修改点 3】清空 Set
+                }}
             />
         </div>
     );
