@@ -22,6 +22,11 @@ export enum OrientationFilter {
     Portrait = 'Portrait',
 }
 
+export enum ControlRevealMode {
+    Tap = 'Tap',
+    CornerButton = 'CornerButton',
+}
+
 export interface AppConfig {
     refreshInterval: number; // in seconds
     fitMode: FitMode;
@@ -30,6 +35,7 @@ export interface AppConfig {
     sortMode: SortMode;
     sortDirection: SortDirection; // NEW: Direction control
     orientationFilter: OrientationFilter;
+    controlRevealMode: ControlRevealMode;
     serverUrl?: string;
     selectedServerPaths?: string[]; // Folders selected on server
 }

@@ -1,5 +1,5 @@
 import React from 'react';
-import { AppConfig, FitMode, SortMode, SortDirection, OrientationFilter } from '../types';
+import { AppConfig, FitMode, SortMode, SortDirection, OrientationFilter, ControlRevealMode } from '../types';
 import { Icons } from './Icon';
 
 interface SettingsModalProps {
@@ -165,6 +165,27 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
                         <label className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">Playback</label>
 
                         <div className="bg-neutral-800/50 p-4 rounded-xl space-y-4">
+                            <div className="flex items-center justify-between">
+                                <div className="flex flex-col">
+                                    <span className="text-neutral-200">Controls Reveal</span>
+                                    <span className="text-xs text-neutral-500">Choose how to show pause/next buttons</span>
+                                </div>
+                                <div className="flex bg-neutral-900 rounded-lg p-1 border border-neutral-800">
+                                    <button
+                                        className={`px-3 py-1.5 text-xs rounded-md transition-all ${config.controlRevealMode === ControlRevealMode.Tap ? 'bg-blue-600 text-white shadow-sm' : 'text-neutral-400 hover:text-neutral-200'}`}
+                                        onClick={() => updateConfig('controlRevealMode', ControlRevealMode.Tap)}
+                                    >
+                                        Tap screen
+                                    </button>
+                                    <button
+                                        className={`px-3 py-1.5 text-xs rounded-md transition-all ${config.controlRevealMode === ControlRevealMode.CornerButton ? 'bg-blue-600 text-white shadow-sm' : 'text-neutral-400 hover:text-neutral-200'}`}
+                                        onClick={() => updateConfig('controlRevealMode', ControlRevealMode.CornerButton)}
+                                    >
+                                        Corner button
+                                    </button>
+                                </div>
+                            </div>
+
                             <div className="flex justify-between">
                                 <span className="text-neutral-200">Interval</span>
                                 <span className="text-blue-400 font-mono">{config.refreshInterval}s</span>

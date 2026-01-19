@@ -57,7 +57,7 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
       </button>
       
       {/* Spacer for alignment symmetry */}
-      <div className="w-14" />
+      <div className="w-2" />
     </div>
   );
 };

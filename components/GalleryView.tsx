@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react';
+import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch';
 import { ImageFile, AppConfig, FitMode } from '../types';
 
 interface GalleryViewProps {
@@ -7,6 +8,8 @@ interface GalleryViewProps {
   isPaused: boolean;
   onNext: () => void;
   onPrev: () => void;
+  onSwipeNext: () => void;
+  onSwipePrev: () => void;
   onTap: () => void;
 }
 
@@ -16,6 +19,8 @@ const GalleryView: React.FC<GalleryViewProps> = ({
   isPaused,
   onNext,
   onPrev,
+  onSwipeNext,
+  onSwipePrev,
   onTap
 }) => {
   const [windowSize, setWindowSize] = useState({ width: window.innerWidth, height: window.innerHeight });
@@ -27,6 +32,11 @@ const GalleryView: React.FC<GalleryViewProps> = ({
 
   const touchStartX = useRef<number | null>(null);
   const touchEndX = useRef<number | null>(null);
+  const lastTapTimeRef = useRef<number>(0);
+  const isTransformingRef = useRef(false);
+  const currentScaleRef = useRef(1);
+  const [isPanningEnabled, setIsPanningEnabled] = useState(false);
+  const [hideSwipeLayer, setHideSwipeLayer] = useState(false);
 
   // Sync props to state
   useEffect(() => {
@@ -49,17 +59,37 @@ const GalleryView: React.FC<GalleryViewProps> = ({
 
   // Swipe Logic
   const handleTouchStart = (e: React.TouchEvent) => {
+    if (isTransformingRef.current || currentScaleRef.current > 1.01) return;
+    if (e.touches.length !== 1) {
+      touchStartX.current = null;
+      touchEndX.current = null;
+      return;
+    }
+    // Single finger: swipe start
     touchStartX.current = e.targetTouches[0].clientX;
   };
 
   const handleTouchMove = (e: React.TouchEvent) => {
+    if (isTransformingRef.current || currentScaleRef.current > 1.01) return;
+    if (e.touches.length !== 1) return;
+    // Single finger swipe
     touchEndX.current = e.targetTouches[0].clientX;
   };
 
   const handleTouchEnd = () => {
+    if (isTransformingRef.current || currentScaleRef.current > 1.01) {
+      touchStartX.current = null;
+      touchEndX.current = null;
+      return;
+    }
+    // Handle swipe
     if (!touchStartX.current || !touchEndX.current) {
       if (touchStartX.current && !touchEndX.current) {
-        onTap();
+        const now = Date.now();
+        if (now - lastTapTimeRef.current > 250) {
+          onTap();
+          lastTapTimeRef.current = now;
+        }
       }
       touchStartX.current = null;
       touchEndX.current = null;
@@ -67,13 +97,13 @@ const GalleryView: React.FC<GalleryViewProps> = ({
     }
 
     const distance = touchStartX.current - touchEndX.current;
-    const isLeftSwipe = distance > 50;
-    const isRightSwipe = distance < -50;
+    const isLeftSwipe = distance > 80;
+    const isRightSwipe = distance < -80;
 
     if (isLeftSwipe) {
-      onNext();
+      onSwipeNext();
     } else if (isRightSwipe) {
-      onPrev();
+      onSwipePrev();
     } else {
       onTap();
     }
@@ -83,9 +113,10 @@ const GalleryView: React.FC<GalleryViewProps> = ({
   };
 
   const handleImageLoad = () => {
-    // New image loaded, remove previous
+    // New image loaded, remove previous and reset zoom
     setIsTransitioning(false);
     setPrevImage(null);
+    setHideSwipeLayer(false);
   };
 
   if (!displayImage && !prevImage) return <div className="w-full h-full bg-black" />;
@@ -93,11 +124,39 @@ const GalleryView: React.FC<GalleryViewProps> = ({
   return (
     <div
       className="relative w-full h-full overflow-hidden bg-black flex items-center justify-center"
-      onTouchStart={handleTouchStart}
-      onTouchMove={handleTouchMove}
-      onTouchEnd={handleTouchEnd}
       onClick={(e) => { e.preventDefault(); }}
     >
+      {/* Swipe Layer (only when not zoomed) */}
+      {!isPanningEnabled && !hideSwipeLayer && (
+        <div
+          className="absolute inset-0 z-30"
+          onTouchStart={(e) => { 
+            if (e.touches.length === 2) {
+              setHideSwipeLayer(true);
+              return;
+            }
+            if (e.touches.length === 1) {
+              e.stopPropagation(); 
+              handleTouchStart(e); 
+            }
+          }}
+          onTouchMove={(e) => { 
+            if (e.touches.length === 1) {
+              e.stopPropagation(); 
+              handleTouchMove(e); 
+            }
+          }}
+          onTouchEnd={(e) => { 
+            if (e.changedTouches.length === 1 && e.touches.length === 0) {
+              e.stopPropagation(); 
+              handleTouchEnd(); 
+            }
+            if (e.touches.length === 0) {
+              setTimeout(() => setHideSwipeLayer(false), 100);
+            }
+          }}
+        />
+      )}
       {/* Previous Image (Background) */}
       {prevImage && (
         <div className="absolute inset-0 z-0">
@@ -112,12 +171,52 @@ const GalleryView: React.FC<GalleryViewProps> = ({
       {/* Current Image (Foreground) */}
       {displayImage && (
         <div className={`absolute inset-0 z-10 transition-opacity duration-300 ${isTransitioning && prevImage ? 'opacity-0' : 'opacity-100'}`}>
-          <SingleImageView
-            image={displayImage}
-            config={config}
-            windowSize={windowSize}
-            onLoad={handleImageLoad}
-          />
+          <TransformWrapper
+            minScale={1}
+            maxScale={5}
+            doubleClick={{ disabled: true }}
+            wheel={{ disabled: true }}
+            panning={{ disabled: !isPanningEnabled }}
+            pinch={{ step: 5 }}
+            key={displayImage.id}
+            onZoom={({ state }) => {
+              currentScaleRef.current = state.scale;
+              const isZoomed = state.scale > 1.01;
+              setIsPanningEnabled(isZoomed);
+              if (!isZoomed) setHideSwipeLayer(false);
+            }}
+            onZoomStop={({ state }) => {
+              currentScaleRef.current = state.scale;
+              const isZoomed = state.scale > 1.01;
+              setIsPanningEnabled(isZoomed);
+              if (!isZoomed) setHideSwipeLayer(false);
+            }}
+            onPinchingStart={() => { isTransformingRef.current = true; }}
+            onPinchingStop={({ state }) => {
+              currentScaleRef.current = state.scale;
+              const isZoomed = state.scale > 1.01;
+              isTransformingRef.current = isZoomed;
+              setIsPanningEnabled(isZoomed);
+              if (!isZoomed) setHideSwipeLayer(false);
+            }}
+            onPanningStart={() => { isTransformingRef.current = true; }}
+            onPanningStop={({ state }) => {
+              currentScaleRef.current = state.scale;
+              const isZoomed = state.scale > 1.01;
+              isTransformingRef.current = isZoomed;
+              setIsPanningEnabled(isZoomed);
+              if (!isZoomed) setHideSwipeLayer(false);
+            }}
+          >
+            <TransformComponent wrapperStyle={{ width: '100%', height: '100%' }} contentStyle={{ width: '100%', height: '100%' }}>
+              <SingleImageView
+                image={displayImage}
+                config={config}
+                windowSize={windowSize}
+                onLoad={handleImageLoad}
+              />
+            </TransformComponent>
+          </TransformWrapper>
         </div>
       )}
 

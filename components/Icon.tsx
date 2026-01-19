@@ -18,6 +18,7 @@ import {
   ArrowUp,
   FilterX
 } from 'lucide-react';
+import { MoreHorizontal } from 'lucide-react';
 
 export const Icons = {
   Settings,
@@ -36,5 +37,6 @@ export const Icons = {
   Date: Calendar,
   File: FileImage,
   Up: ArrowUp,
-  FilterX
+  FilterX,
+  More: MoreHorizontal
 };

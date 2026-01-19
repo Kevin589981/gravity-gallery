@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { AppConfig, ImageFile, SortMode, SortDirection, OrientationFilter } from './types';
+import { AppConfig, ImageFile, SortMode, SortDirection, OrientationFilter, ControlRevealMode } from './types';
 import { DEFAULT_CONFIG } from './constants';
 import { isImageFile, createImageObject, shuffleArray, preloadImageAsBlob, naturalSort } from './utils/imageUtils';
 import Landing from './components/Landing';
@@ -34,14 +34,15 @@ const App: React.FC = () => {
         if (saved) {
             try {
                 const parsed = JSON.parse(saved);
-                if (parsed.config) setConfig(parsed.config);
-                if (parsed.config?.serverUrl && parsed.config?.selectedServerPaths) {
+                const mergedConfig: AppConfig = parsed.config ? { ...DEFAULT_CONFIG, ...parsed.config } : DEFAULT_CONFIG;
+                setConfig(mergedConfig);
+                if (mergedConfig.serverUrl && mergedConfig.selectedServerPaths) {
                     fetchServerPlaylist(
-                        parsed.config.serverUrl,
-                        parsed.config.selectedServerPaths,
-                        parsed.config.sortMode,
-                        parsed.config.sortDirection,
-                        parsed.config.orientationFilter,
+                        mergedConfig.serverUrl,
+                        mergedConfig.selectedServerPaths,
+                        mergedConfig.sortMode,
+                        mergedConfig.sortDirection,
+                        mergedConfig.orientationFilter,
                         null
                     );
                 }
@@ -269,6 +270,29 @@ const App: React.FC = () => {
         }, 3000);
     }, [showSettings]);
 
+    const hideUI = useCallback(() => {
+        if (uiTimeoutRef.current) {
+            clearTimeout(uiTimeoutRef.current);
+            uiTimeoutRef.current = null;
+        }
+        setIsUIOpen(false);
+    }, []);
+
+    const handleTapReveal = useCallback(() => {
+        if (showSettings) return;
+
+        if (config.controlRevealMode === ControlRevealMode.Tap) {
+            resetUITimer();
+            return;
+        }
+
+        if (config.controlRevealMode === ControlRevealMode.CornerButton) {
+            if (isUIOpen) {
+                hideUI();
+            }
+        }
+    }, [config.controlRevealMode, hideUI, isUIOpen, resetUITimer, showSettings]);
+
     // --- Render Logic ---
     if (isLoading) {
         return (
@@ -305,8 +329,18 @@ const App: React.FC = () => {
 
     return (
         <div className="relative h-screen w-screen overflow-hidden bg-black">
-            <GalleryView image={currentImage} config={config} isPaused={isPaused} onNext={() => { nextImage(); resetUITimer(); }} onPrev={() => { prevImage(); resetUITimer(); }} onTap={resetUITimer} />
+            <GalleryView image={currentImage} config={config} isPaused={isPaused} onNext={() => { nextImage(); resetUITimer(); }} onPrev={() => { prevImage(); resetUITimer(); }} onSwipeNext={nextImage} onSwipePrev={prevImage} onTap={handleTapReveal} />
             <ControlPanel visible={isUIOpen} isPaused={isPaused} onTogglePause={() => { setIsPaused(!isPaused); resetUITimer(); }} onNext={() => { nextImage(); resetUITimer(); }} onPrev={() => { prevImage(); resetUITimer(); }} onSettings={() => { setShowSettings(true); setIsPaused(true); }} />
+
+            {config.controlRevealMode === ControlRevealMode.CornerButton && !isUIOpen && (
+                <button
+                    onClick={(e) => { e.stopPropagation(); resetUITimer(); }}
+                    className="absolute bottom-[calc(0.25rem_+_env(safe-area-inset-bottom))] left-4 z-40 w-11 h-11 rounded-full bg-white/25 text-white/90 flex items-center justify-center shadow-lg shadow-black/40 backdrop-blur-md active:scale-95 transition-all"
+                    aria-label="Show controls"
+                >
+                    <Icons.More className="w-6 h-6" />
+                </button>
+            )}
             <SettingsModal isOpen={showSettings} onClose={() => { setShowSettings(false); setIsPaused(false); resetUITimer(); }} config={config} onConfigChange={setConfig} fileCount={allImages.length}
                 onReselectFolder={() => { setAllImages([]); setShowSettings(false); localStorage.removeItem(STORAGE_KEY); preloadInProgress.current.clear(); }}
             />

@@ -1,4 +1,4 @@
-import { AppConfig, FitMode, SortMode, SortDirection, OrientationFilter } from './types';
+import { AppConfig, FitMode, SortMode, SortDirection, OrientationFilter, ControlRevealMode } from './types';
 
 export const DEFAULT_CONFIG: AppConfig = {
     refreshInterval: 5,
@@ -8,6 +8,7 @@ export const DEFAULT_CONFIG: AppConfig = {
     sortMode: SortMode.Shuffle,
     sortDirection: SortDirection.Forward, // NEW: Default direction
     orientationFilter: OrientationFilter.Both,
+    controlRevealMode: ControlRevealMode.Tap,
 };
 
 // You can change this IP to match your computer's local IP
