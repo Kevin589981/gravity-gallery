@@ -33,6 +33,8 @@ const GalleryView: React.FC<GalleryViewProps> = ({
   const touchStartX = useRef<number | null>(null);
   const touchEndX = useRef<number | null>(null);
   const lastTapTimeRef = useRef<number>(0);
+  const lastTapTimeForDoubleTapRef = useRef<number>(0);
+  const doubleTapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isTransformingRef = useRef(false);
   const currentScaleRef = useRef(1);
   const [isPanningEnabled, setIsPanningEnabled] = useState(false);
@@ -123,7 +125,7 @@ const GalleryView: React.FC<GalleryViewProps> = ({
 
   return (
     <div
-      className="relative w-full h-full overflow-hidden bg-black flex items-center justify-center"
+      className="relative w-full h-full bg-black flex items-center justify-center"
       onClick={(e) => { e.preventDefault(); }}
     >
       {/* Swipe Layer (only when not zoomed) */}
@@ -132,10 +134,27 @@ const GalleryView: React.FC<GalleryViewProps> = ({
           className="absolute inset-0 z-30"
           onTouchStart={(e) => { 
             if (e.touches.length === 2) {
+              // Two fingers detected - hide layer and let event pass through
               setHideSwipeLayer(true);
-              return;
+              return; // Don't stop propagation, let pinch gesture reach the library
             }
             if (e.touches.length === 1) {
+              const now = Date.now();
+              const timeSinceLastTap = now - lastTapTimeForDoubleTapRef.current;
+              
+              // Double tap detection (within 300ms)
+              if (timeSinceLastTap < 300 && timeSinceLastTap > 0) {
+                // Double tap detected - hide layer and let event pass through to zoom library
+                if (doubleTapTimerRef.current) {
+                  clearTimeout(doubleTapTimerRef.current);
+                  doubleTapTimerRef.current = null;
+                }
+                setHideSwipeLayer(true);
+                setTimeout(() => setHideSwipeLayer(false), 100);
+                return; // Don't stop propagation, let double tap reach the library
+              }
+              
+              lastTapTimeForDoubleTapRef.current = now;
               e.stopPropagation(); 
               handleTouchStart(e); 
             }
@@ -151,10 +170,8 @@ const GalleryView: React.FC<GalleryViewProps> = ({
               e.stopPropagation(); 
               handleTouchEnd(); 
             }
-            if (e.touches.length === 0) {
-              setTimeout(() => setHideSwipeLayer(false), 100);
-            }
           }}
+          style={{ pointerEvents: hideSwipeLayer ? 'none' : 'auto' }}
         />
       )}
       {/* Previous Image (Background) */}
@@ -174,11 +191,13 @@ const GalleryView: React.FC<GalleryViewProps> = ({
           <TransformWrapper
             minScale={1}
             maxScale={5}
-            doubleClick={{ disabled: true }}
+            doubleClick={{ disabled: false, step: 2 }}
             wheel={{ disabled: true }}
             panning={{ disabled: !isPanningEnabled }}
             pinch={{ step: 5 }}
             key={displayImage.id}
+            limitToBounds={false}
+            centerOnInit={true}
             onZoom={({ state }) => {
               currentScaleRef.current = state.scale;
               const isZoomed = state.scale > 1.01;
@@ -208,7 +227,7 @@ const GalleryView: React.FC<GalleryViewProps> = ({
               if (!isZoomed) setHideSwipeLayer(false);
             }}
           >
-            <TransformComponent wrapperStyle={{ width: '100%', height: '100%' }} contentStyle={{ width: '100%', height: '100%' }}>
+            <TransformComponent wrapperStyle={{ width: '100%', height: '100%', overflow: 'visible' }} contentStyle={{ width: '100%', height: '100%', overflow: 'visible' }}>
               <SingleImageView
                 image={displayImage}
                 config={config}
