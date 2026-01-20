@@ -24,6 +24,16 @@ const App: React.FC = () => {
     const uiTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const preloadInProgress = useRef<Set<string>>(new Set());
+    const playlistVersionRef = useRef(0);
+    const playlistFetchSeqRef = useRef(0);
+    const pendingServerFetchRef = useRef<{
+        url: string;
+        paths: string[];
+        sort: SortMode;
+        direction: SortDirection;
+        orientation: OrientationFilter;
+        currentPath: string | null;
+    } | null>(null);
     
     // 用于防止在设置更改时 useEffect 多次触发 fetch
     const fetchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -63,18 +73,25 @@ const App: React.FC = () => {
         if (fetchDebounceRef.current) clearTimeout(fetchDebounceRef.current);
         
         fetchDebounceRef.current = setTimeout(() => {
-            if (isLoading) return;
-
             if (config.serverUrl && config.selectedServerPaths) {
                 const currentImagePath = allImages.length > 0 ? allImages[currentIndex]?.id : null;
-                fetchServerPlaylist(
-                    config.serverUrl,
-                    config.selectedServerPaths,
-                    config.sortMode,
-                    config.sortDirection,
-                    config.orientationFilter,
-                    currentImagePath
-                );
+                // If a fetch is already in-flight, queue the latest desired fetch instead of skipping.
+                pendingServerFetchRef.current = {
+                    url: config.serverUrl,
+                    paths: config.selectedServerPaths,
+                    sort: config.sortMode,
+                    direction: config.sortDirection,
+                    orientation: config.orientationFilter,
+                    currentPath: currentImagePath,
+                };
+
+                if (!isLoading) {
+                    const req = pendingServerFetchRef.current;
+                    pendingServerFetchRef.current = null;
+                    if (req) {
+                        fetchServerPlaylist(req.url, req.paths, req.sort, req.direction, req.orientation, req.currentPath);
+                    }
+                }
             } else if (!config.serverUrl) {
                 // Local Mode Logic
                 let sorted = [...allImages];
@@ -86,6 +103,7 @@ const App: React.FC = () => {
                 if (config.sortDirection === SortDirection.Reverse) {
                     sorted.reverse();
                 }
+                playlistVersionRef.current += 1;
                 setAllImages(sorted);
                 setCurrentIndex(0);
             }
@@ -94,11 +112,24 @@ const App: React.FC = () => {
         return () => {
             if (fetchDebounceRef.current) clearTimeout(fetchDebounceRef.current);
         };
-    }, [config.sortMode, config.sortDirection, config.orientationFilter]);
+    }, [config.serverUrl, config.selectedServerPaths, config.sortMode, config.sortDirection, config.orientationFilter]);
+
+    // If a server playlist fetch was skipped due to loading, run it once loading ends.
+    useEffect(() => {
+        if (isLoading) return;
+        const req = pendingServerFetchRef.current;
+        if (!req) return;
+        pendingServerFetchRef.current = null;
+        fetchServerPlaylist(req.url, req.paths, req.sort, req.direction, req.orientation, req.currentPath);
+    }, [isLoading]);
 
     // --- Preload Logic ---
     useEffect(() => {
         if (allImages.length === 0) return;
+
+        // Capture the current playlist version to prevent stale preload results
+        // from being applied after a playlist refresh.
+        const playlistVersion = playlistVersionRef.current;
 
         const indicesToPreload: number[] = [];
         for (let i = 1; i <= PRELOAD_BATCH_SIZE; i++) {
@@ -117,6 +148,10 @@ const App: React.FC = () => {
             preloadInProgress.current.add(img.id);
             try {
                 const { blobUrl, isLandscape } = await preloadImageAsBlob(img.url);
+
+                // If playlist changed while we were preloading, drop the result.
+                if (playlistVersionRef.current !== playlistVersion) return;
+
                 setAllImages(prev => {
                     const newArr = [...prev];
                     if (newArr[idx] && newArr[idx].id === img.id) {
@@ -125,6 +160,10 @@ const App: React.FC = () => {
                     return newArr;
                 });
             } catch (e) {
+                // ignore
+            } finally {
+                // Always release the lock. Otherwise a playlist refresh can make an image
+                // permanently appear "in-progress" even if its blobUrl was never attached.
                 preloadInProgress.current.delete(img.id);
             }
         });
@@ -140,6 +179,7 @@ const App: React.FC = () => {
         orientation: OrientationFilter,
         currentPath: string | null
     ) => {
+        const fetchSeq = ++playlistFetchSeqRef.current;
         setIsLoading(true);
         preloadInProgress.current.clear();
 
@@ -172,7 +212,11 @@ const App: React.FC = () => {
             if (!res.ok) throw new Error("Failed to get playlist");
             const relPaths: string[] = await res.json();
 
+            // If a newer fetch started after this one, ignore this response.
+            if (fetchSeq !== playlistFetchSeqRef.current) return;
+
             if (relPaths.length === 0) {
+                playlistVersionRef.current += 1;
                 setAllImages([]);
                 setNoMatchesFound(true);
             } else {
@@ -182,6 +226,7 @@ const App: React.FC = () => {
                     name: relPath.split('/').pop() || 'Image',
                     isLandscape: false
                 }));
+                playlistVersionRef.current += 1;
                 setAllImages(imageObjects);
                 setCurrentIndex(0);
                 setNoMatchesFound(false);
@@ -212,6 +257,7 @@ const App: React.FC = () => {
         if (config.sortMode === SortMode.Shuffle) sorted = shuffleArray(processedImages);
         if (config.sortDirection === SortDirection.Reverse) sorted.reverse();
 
+        playlistVersionRef.current += 1;
         setAllImages(sorted);
         setConfig(prev => ({ ...prev, serverUrl: undefined, selectedServerPaths: undefined }));
         setCurrentIndex(0);
@@ -223,8 +269,7 @@ const App: React.FC = () => {
     
     const handleServerStart = (url: string, paths: string[]) => {
         setConfig(prev => ({ ...prev, serverUrl: url, selectedServerPaths: paths }));
-        // Initial fetch has no current path
-        fetchServerPlaylist(url, paths, config.sortMode, config.sortDirection, config.orientationFilter, null);
+        // Fetch is handled by the debounced config effect.
     };
 
     const loadDemoImages = async () => {
@@ -232,6 +277,7 @@ const App: React.FC = () => {
         preloadInProgress.current.clear();
         const demoUrls = ['https://picsum.photos/1920/1080', 'https://picsum.photos/1080/1920', 'https://picsum.photos/2000/3000', 'https://picsum.photos/3000/2000', 'https://picsum.photos/1500/1500'];
         const processed = await Promise.all(demoUrls.map((u, i) => createImageObject(`${u}?r=${i}`)));
+        playlistVersionRef.current += 1;
         setAllImages(shuffleArray(processed));
         setConfig(prev => ({ ...prev, serverUrl: undefined, selectedServerPaths: undefined }));
         setCurrentIndex(0);
