@@ -1,20 +1,17 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# Gravity Gallery
 
-# Run and deploy your AI Studio app
+本项目是一个基于 Vite + React 的本地/服务器图片画廊应用。
 
-This contains everything you need to run your app locally.
+## 本地运行
 
-View your app in AI Studio: https://ai.studio/apps/drive/1Yt1E1Tqm5jJyuZ4CP3URCB-ytQJJdPuI
+**前置条件：** Node.js
 
-## Run Locally
-
-**Prerequisites:**  Node.js
-
-
-1. Install dependencies:
+1. 安装依赖：
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
+2. 启动开发服务器：
    `npm run dev`
+
+## 构建与预览
+
+- 生产构建：`npm run build`
+- 本地预览：`npm run preview`
