@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Icons } from './Icon';
 import FileBrowser from './FileBrowser';
-import { DEFAULT_SERVER_URL } from '../constants';
+import { DEFAULT_SERVER_URL, FALLBACK_SERVER_URL } from '../constants';
 
 interface LandingProps {
   onFolderSelect: (e: React.ChangeEvent<HTMLInputElement>) => void;
@@ -20,18 +20,66 @@ const Landing: React.FC<LandingProps> = ({ onFolderSelect, onServerConnectAndPla
     if (initialServerUrl) setServerUrl(initialServerUrl);
   }, [initialServerUrl]);
 
+  const normalizeServerUrl = (value: string) => {
+    const trimmed = value.trim();
+    if (!trimmed) return '';
+    return trimmed.startsWith('http') ? trimmed : `http://${trimmed}`;
+  };
+
+  const deriveDeviceNameFromHost = () => {
+    const host = window.location.hostname;
+    if (!host || host === 'localhost') return '';
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return '';
+    if (host.endsWith('.local')) return host.replace(/\.local$/, '');
+    if (host.includes('.')) return '';
+    return host;
+  };
+
+  const buildDefaultCandidates = () => {
+    const derivedName = deriveDeviceNameFromHost();
+    const candidates = [
+      derivedName ? `http://${derivedName}.local:4860` : '',
+      DEFAULT_SERVER_URL,
+      FALLBACK_SERVER_URL,
+    ].filter(Boolean) as string[];
+
+    return Array.from(new Set(candidates));
+  };
+
+  const canReachServer = async (url: string, timeoutMs = 1200) => {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      await fetch(`${url}/openapi.json`, {
+        method: 'GET',
+        mode: 'cors',
+        signal: controller.signal,
+      });
+      return true;
+    } catch {
+      return false;
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+  };
+
+  const resolveDefaultServerUrl = async () => {
+    const candidates = buildDefaultCandidates();
+    for (const candidate of candidates) {
+      if (await canReachServer(candidate)) return candidate;
+    }
+    return candidates[candidates.length - 1] || DEFAULT_SERVER_URL;
+  };
+
   // Connection logic just validates URL format and switches UI
-  const handleConnectClick = (e: React.FormEvent) => {
+  const handleConnectClick = async (e: React.FormEvent) => {
     e.preventDefault();
-    
-    // Use default URL if input is empty, otherwise use input
-    let url = serverUrl.trim();
+
+    let url = normalizeServerUrl(serverUrl);
     if (!url) {
-        url = DEFAULT_SERVER_URL;
+      url = await resolveDefaultServerUrl();
     }
 
-    if (!url.startsWith('http')) url = `http://${url}`;
-    
     // Update state to reflect the actual URL being used
     setServerUrl(url);
     setIsConnected(true);
