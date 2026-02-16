@@ -40,6 +40,23 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
         }
     };
 
+    const handleToggleParentDirAccess = async () => {
+        if (!config.serverUrl) return;
+        try {
+            const base = config.serverUrl.endsWith('/') ? config.serverUrl.slice(0, -1) : config.serverUrl;
+            const res = await fetch(`${base}/api/runtime-config/toggle`, { method: 'POST' });
+            if (!res.ok) {
+                alert("Failed to toggle parent directory access.");
+                return;
+            }
+            const data = await res.json();
+            const enabled = !!data.allow_parent_dir_access;
+            alert(`Parent directory access is now ${enabled ? 'ON' : 'OFF'}.`);
+        } catch (e) {
+            alert("Connection error.");
+        }
+    };
+
     return (
         <div className="fixed inset-0 z-[60] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
             <div className="bg-neutral-900 border border-neutral-800 w-full max-w-md rounded-2xl overflow-hidden shadow-2xl flex flex-col max-h-[90vh]">
@@ -75,12 +92,20 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
                             </div>
 
                             {config.serverUrl && (
-                                <button
-                                    onClick={handleRescanLibrary}
-                                    className="mt-2 w-full py-2 bg-blue-900/30 text-blue-400 border border-blue-900/50 rounded-lg text-xs font-medium hover:bg-blue-900/50 transition-colors flex items-center justify-center gap-2"
-                                >
-                                    <Icons.Refresh className="w-3 h-3" /> Rescan Library for New Files
-                                </button>
+                                <div className="mt-2 space-y-2">
+                                    <button
+                                        onClick={handleRescanLibrary}
+                                        className="w-full py-2 bg-blue-900/30 text-blue-400 border border-blue-900/50 rounded-lg text-xs font-medium hover:bg-blue-900/50 transition-colors flex items-center justify-center gap-2"
+                                    >
+                                        <Icons.Refresh className="w-3 h-3" /> Rescan Library for New Files
+                                    </button>
+                                    <button
+                                        onClick={handleToggleParentDirAccess}
+                                        className="w-full py-2 bg-amber-900/30 text-amber-300 border border-amber-900/50 rounded-lg text-xs font-medium hover:bg-amber-900/50 transition-colors"
+                                    >
+                                        Toggle Parent Directory Access
+                                    </button>
+                                </div>
                             )}
                         </div>
                     </div>

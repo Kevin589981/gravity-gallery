@@ -25,14 +25,15 @@ DB_PATH = os.path.join(ROOT_DIR, "gallery_metadata.db")
 ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
 PLAYLIST_MAX_AGE_DAYS = 365  # Playlist 在数据库中保留的最大天数
 
-os.environ['GALLERY_ALLOW_PARENT_DIR_ACCESS'] = '0'
 def env_to_bool(name: str, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
 
-ALLOW_PARENT_DIR_ACCESS = env_to_bool("GALLERY_ALLOW_PARENT_DIR_ACCESS", True)
+def allow_parent_dir_access() -> bool:
+    """热读取父目录访问开关。"""
+    return env_to_bool("GALLERY_ALLOW_PARENT_DIR_ACCESS", True)
 
 # --- Pydantic 模型 ---
 class PlaylistRequest(BaseModel):
@@ -46,6 +47,9 @@ class RestorePlaylistRequest(BaseModel):
     """用于前端主动恢复 playlist 的请求模型"""
     playlist: List[str]
     current_index: int = 0
+
+class RuntimeConfigRequest(BaseModel):
+    allow_parent_dir_access: bool
 
 # --- 全局缓存与会话 ---
 class UserSession:
@@ -231,7 +235,7 @@ def sanitize_playlist_paths(paths: List[str]) -> List[str]:
             normalized.append(".")
             continue
         rel = normalize_rel_path(path)
-        if not ALLOW_PARENT_DIR_ACCESS and not is_path_in_root_dir(rel):
+        if not allow_parent_dir_access() and not is_path_in_root_dir(rel):
             normalized.append(".")
         else:
             normalized.append(rel)
@@ -409,6 +413,32 @@ async def trigger_scan(background_tasks: BackgroundTasks):
     background_tasks.add_task(scan_library_task)
     return {"status": "scanning_started"}
 
+@app.get("/api/runtime-config")
+async def get_runtime_config():
+    return {
+        "allow_parent_dir_access": allow_parent_dir_access(),
+        "env_value": os.environ.get("GALLERY_ALLOW_PARENT_DIR_ACCESS", "<unset>")
+    }
+
+@app.post("/api/runtime-config")
+async def set_runtime_config(req: RuntimeConfigRequest):
+    os.environ["GALLERY_ALLOW_PARENT_DIR_ACCESS"] = "1" if req.allow_parent_dir_access else "0"
+    return {
+        "status": "ok",
+        "allow_parent_dir_access": allow_parent_dir_access(),
+        "env_value": os.environ.get("GALLERY_ALLOW_PARENT_DIR_ACCESS", "<unset>")
+    }
+
+@app.post("/api/runtime-config/toggle")
+async def toggle_runtime_config():
+    new_value = not allow_parent_dir_access()
+    os.environ["GALLERY_ALLOW_PARENT_DIR_ACCESS"] = "1" if new_value else "0"
+    return {
+        "status": "ok",
+        "allow_parent_dir_access": allow_parent_dir_access(),
+        "env_value": os.environ.get("GALLERY_ALLOW_PARENT_DIR_ACCESS", "<unset>")
+    }
+
 @app.post("/api/playlist")
 async def get_playlist(req: PlaylistRequest, request: Request, background_tasks: BackgroundTasks):
     
@@ -555,7 +585,7 @@ async def get_playlist(req: PlaylistRequest, request: Request, background_tasks:
 
     # --- 步骤 3: 如果前端提供了当前位置，就旋转列表 ---
     current_path = normalize_rel_path(req.current_path) if req.current_path else None
-    if current_path and (ALLOW_PARENT_DIR_ACCESS or is_path_in_root_dir(current_path)) and current_path in final_paths:
+    if current_path and (allow_parent_dir_access() or is_path_in_root_dir(current_path)) and current_path in final_paths:
         try:
             print(f"🔄 检测到 current_path='{os.path.basename(current_path)}', 正在旋转列表...")
             start_index = final_paths.index(current_path)
@@ -662,7 +692,7 @@ async def browse_folder(path: str = ""):
     else:
         normalized = normalize_rel_path(path)
         target_path = os.path.abspath(os.path.join(ROOT_DIR, normalized))
-        if not ALLOW_PARENT_DIR_ACCESS and not is_path_in_root_dir(normalized):
+        if not allow_parent_dir_access() and not is_path_in_root_dir(normalized):
             target_path = ROOT_DIR
             rel_path = ""
         else:
@@ -708,7 +738,7 @@ def resolve_full_file_path(path_value: str) -> tuple[str, str]:
 
 async def serve_file_core(path_value: str, request: Request, background_tasks: BackgroundTasks):
     rel_path, full_path = resolve_full_file_path(path_value)
-    if not ALLOW_PARENT_DIR_ACCESS and not is_path_in_root_dir(rel_path):
+    if not allow_parent_dir_access() and not is_path_in_root_dir(rel_path):
         return JSONResponse(status_code=403, content={"message": "Access outside ROOT_DIR is disabled"})
     if not os.path.exists(full_path) or not os.path.isfile(full_path):
         return JSONResponse(status_code=404, content={"message": "File not found"})
