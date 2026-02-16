@@ -25,6 +25,15 @@ DB_PATH = os.path.join(ROOT_DIR, "gallery_metadata.db")
 ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
 PLAYLIST_MAX_AGE_DAYS = 365  # Playlist 在数据库中保留的最大天数
 
+os.environ['GALLERY_ALLOW_PARENT_DIR_ACCESS'] = '0'
+def env_to_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+ALLOW_PARENT_DIR_ACCESS = env_to_bool("GALLERY_ALLOW_PARENT_DIR_ACCESS", True)
+
 # --- Pydantic 模型 ---
 class PlaylistRequest(BaseModel):
     paths: List[str]
@@ -211,6 +220,23 @@ def is_db_path_under_root(db_path: str) -> bool:
 def normalize_rel_path(path: str) -> str:
     return (path or "").replace('\\', '/').strip('/').replace('/./', '/')
 
+def sanitize_playlist_paths(paths: List[str]) -> List[str]:
+    """
+    对 playlist 请求路径做标准化。
+    当不允许访问父目录时，所有越界路径都回退为 '.'，从而返回 ROOT_DIR 结果。
+    """
+    normalized = []
+    for path in paths:
+        if not path or path == ".":
+            normalized.append(".")
+            continue
+        rel = normalize_rel_path(path)
+        if not ALLOW_PARENT_DIR_ACCESS and not is_path_in_root_dir(rel):
+            normalized.append(".")
+        else:
+            normalized.append(rel)
+    return list(dict.fromkeys(normalized))
+
 def escape_like_pattern(value: str) -> str:
     return value.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
 
@@ -389,8 +415,10 @@ async def get_playlist(req: PlaylistRequest, request: Request, background_tasks:
     if not req.paths:
         return []
 
+    req_paths = sanitize_playlist_paths(req.paths)
+
     # --- 步骤 1: 外部路径先做按需同步（确保第二次访问时能清理失效记录） ---
-    external_paths = [normalize_rel_path(p) for p in req.paths if p not in ("", ".") and not is_path_in_root_dir(p)]
+    external_paths = [normalize_rel_path(p) for p in req_paths if p not in ("", ".") and not is_path_in_root_dir(p)]
     external_paths = list(dict.fromkeys(external_paths))
     for ext_path in external_paths:
         if ext_path not in external_synced_paths_this_boot:
@@ -405,7 +433,7 @@ async def get_playlist(req: PlaylistRequest, request: Request, background_tasks:
 
         for p in paths:
             if p == "" or p == ".":
-                path_conditions.append("1=1")
+                path_conditions.append("path NOT LIKE '../%'")
             else:
                 path_conditions.append("path LIKE ? || '/%'")
                 params.append(p)
@@ -435,12 +463,12 @@ async def get_playlist(req: PlaylistRequest, request: Request, background_tasks:
                     missing.append(p)
         return missing
 
-    results = query_images_from_db(req.paths)
+    results = query_images_from_db(req_paths)
     print(f"📚 数据库查询完成，获得 {len(results)} 张图片")
 
     # 仅对“数据库无任何命中”的路径执行扫描（SQL 层判断），避免 Python 层大列表遍历
     # 已同步过的外部路径不再重复扫描
-    missing_paths = get_missing_paths_from_db(req.paths)
+    missing_paths = get_missing_paths_from_db(req_paths)
     if external_paths:
         external_set = {normalize_rel_path(p) for p in external_paths}
         missing_paths = [p for p in missing_paths if normalize_rel_path(p) not in external_set]
@@ -458,7 +486,7 @@ async def get_playlist(req: PlaylistRequest, request: Request, background_tasks:
             save_images_to_db(scanned_results)
 
         # 扫描回填后再查一次数据库，确保排序/过滤逻辑一致
-        results = query_images_from_db(req.paths)
+        results = query_images_from_db(req_paths)
         print(f"📚 回填后数据库查询完成，获得 {len(results)} 张图片")
 
     # 去重：防止用户选择重叠目录时重复图片进入播放列表
@@ -526,10 +554,11 @@ async def get_playlist(req: PlaylistRequest, request: Request, background_tasks:
         final_paths.reverse()
 
     # --- 步骤 3: 如果前端提供了当前位置，就旋转列表 ---
-    if req.current_path and req.current_path in final_paths:
+    current_path = normalize_rel_path(req.current_path) if req.current_path else None
+    if current_path and (ALLOW_PARENT_DIR_ACCESS or is_path_in_root_dir(current_path)) and current_path in final_paths:
         try:
-            print(f"🔄 检测到 current_path='{os.path.basename(req.current_path)}', 正在旋转列表...")
-            start_index = final_paths.index(req.current_path)
+            print(f"🔄 检测到 current_path='{os.path.basename(current_path)}', 正在旋转列表...")
+            start_index = final_paths.index(current_path)
             final_paths = final_paths[start_index:] + final_paths[:start_index]
         except ValueError:
             pass
@@ -626,14 +655,18 @@ async def get_session_status(request: Request):
 
 @app.get("/api/browse")
 async def browse_folder(path: str = ""):
-    # 支持访问 ROOT_DIR 外的目录（向上浏览 ..）
+    # 支持访问 ROOT_DIR 外的目录（向上浏览 ..），可由开关控制
     if not path or path == ".":
         target_path = ROOT_DIR
         rel_path = ""
     else:
-        # 允许 .. 向上导航
-        target_path = os.path.abspath(os.path.join(ROOT_DIR, path))
-        rel_path = os.path.relpath(target_path, ROOT_DIR)
+        normalized = normalize_rel_path(path)
+        target_path = os.path.abspath(os.path.join(ROOT_DIR, normalized))
+        if not ALLOW_PARENT_DIR_ACCESS and not is_path_in_root_dir(normalized):
+            target_path = ROOT_DIR
+            rel_path = ""
+        else:
+            rel_path = os.path.relpath(target_path, ROOT_DIR)
     
     if not os.path.exists(target_path) or not os.path.isdir(target_path):
         raise HTTPException(status_code=404, detail="Folder not found")
@@ -675,6 +708,8 @@ def resolve_full_file_path(path_value: str) -> tuple[str, str]:
 
 async def serve_file_core(path_value: str, request: Request, background_tasks: BackgroundTasks):
     rel_path, full_path = resolve_full_file_path(path_value)
+    if not ALLOW_PARENT_DIR_ACCESS and not is_path_in_root_dir(rel_path):
+        return JSONResponse(status_code=403, content={"message": "Access outside ROOT_DIR is disabled"})
     if not os.path.exists(full_path) or not os.path.isfile(full_path):
         return JSONResponse(status_code=404, content={"message": "File not found"})
 
