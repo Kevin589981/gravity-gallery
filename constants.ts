@@ -12,8 +12,8 @@ export const DEFAULT_CONFIG: AppConfig = {
 };
 
 export const DEFAULT_SERVER_HOSTNAME = '<hostname>';
-export const DEFAULT_SERVER_URL = `http://${DEFAULT_SERVER_HOSTNAME}.local:4860`;
+export const DEFAULT_SERVER_URL = `https://${DEFAULT_SERVER_HOSTNAME}.local:4860`;
 // You can change this IP to match your computer's local IP
-export const FALLBACK_SERVER_URL = 'http://<ip>:4860';
+export const FALLBACK_SERVER_URL = 'https://<ip>:4860';
 
 export const SUPPORTED_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg'];

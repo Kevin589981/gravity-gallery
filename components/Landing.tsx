@@ -23,7 +23,7 @@ const Landing: React.FC<LandingProps> = ({ onFolderSelect, onServerConnectAndPla
   const normalizeServerUrl = (value: string) => {
     const trimmed = value.trim();
     if (!trimmed) return '';
-    return trimmed.startsWith('http') ? trimmed : `http://${trimmed}`;
+    return trimmed.startsWith('https://') || trimmed.startsWith('http://') ? trimmed : `https://${trimmed}`;
   };
 
   const deriveDeviceNameFromHost = () => {
@@ -38,7 +38,7 @@ const Landing: React.FC<LandingProps> = ({ onFolderSelect, onServerConnectAndPla
   const buildDefaultCandidates = () => {
     const derivedName = deriveDeviceNameFromHost();
     const candidates = [
-      derivedName ? `http://${derivedName}.local:4860` : '',
+      derivedName ? `https://${derivedName}.local:4860` : '',
       DEFAULT_SERVER_URL,
       FALLBACK_SERVER_URL,
     ].filter(Boolean) as string[];
@@ -149,7 +149,7 @@ const Landing: React.FC<LandingProps> = ({ onFolderSelect, onServerConnectAndPla
             <form onSubmit={handleConnectClick} className="flex gap-2 animate-in fade-in slide-in-from-bottom-2">
               <input 
                 type="text"
-                placeholder={DEFAULT_SERVER_URL.replace('http://', '')}
+                placeholder={DEFAULT_SERVER_URL.replace(/^https?:\/\//, '')}
                 value={serverUrl}
                 onChange={(e) => setServerUrl(e.target.value)}
                 className="flex-1 bg-neutral-800 border border-neutral-700 text-white px-4 py-3 rounded-xl focus:outline-none focus:border-blue-500 text-sm placeholder-neutral-500"

@@ -17,7 +17,10 @@ from natsort import natsort_key
 from cachetools import LRUCache
 
 # --- 配置 ---
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.environ.get("GALLERY_ROOT_DIR", os.path.dirname(os.path.abspath(__file__)))
+CERT_DIR = os.environ.get("GALLERY_CERT_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "certificates"))
+SSL_CERT_FILE = os.environ.get("GALLERY_SSL_CERT", os.path.join(CERT_DIR, "<hostname>.local+2.pem"))
+SSL_KEY_FILE = os.environ.get("GALLERY_SSL_KEY", os.path.join(CERT_DIR, "<hostname>.local+2-key.pem"))
 DB_PATH = os.path.join(ROOT_DIR, "gallery_metadata.db")
 ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
 PLAYLIST_MAX_AGE_DAYS = 365  # Playlist 在数据库中保留的最大天数
