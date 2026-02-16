@@ -9,10 +9,10 @@ export default defineConfig(() => ({
     host: '0.0.0.0',
     https: {
       key: fs.readFileSync(
-        process.env.VITE_DEV_KEY || path.resolve(__dirname, 'certificates', '<hostname>.local+2-key.pem')
+        process.env.VITE_DEV_KEY || path.resolve(__dirname, 'certificates', '<hostname>.local+1-key.pem')
       ),
       cert: fs.readFileSync(
-        process.env.VITE_DEV_CERT || path.resolve(__dirname, 'certificates', '<hostname>.local+2.pem')
+        process.env.VITE_DEV_CERT || path.resolve(__dirname, 'certificates', '<hostname>.local+1.pem')
       ),
     },
   },
