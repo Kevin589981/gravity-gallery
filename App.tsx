@@ -222,7 +222,7 @@ const App: React.FC = () => {
             } else {
                 const imageObjects = relPaths.map(relPath => ({
                     id: relPath,
-                    url: `${base}/${relPath}`,
+                    url: `${base}/api/file?path=${encodeURIComponent(relPath)}`,
                     name: relPath.split('/').pop() || 'Image',
                     isLandscape: false
                 }));

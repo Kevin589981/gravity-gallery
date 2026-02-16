@@ -61,10 +61,9 @@ const FileBrowser: React.FC<FileBrowserProps> = ({ serverUrl, onPlay, onCancel }
   };
 
   const handleUpLevel = () => {
-    if (!currentPath) return;
-    const parts = currentPath.split('/');
-    parts.pop();
-    fetchDir(parts.join('/'));
+    const normalizedPath = currentPath === '.' ? '' : currentPath;
+    const nextPath = normalizedPath ? `${normalizedPath}/..` : '..';
+    fetchDir(nextPath);
   };
 
   const handleSelectAllInView = () => {
@@ -106,17 +105,15 @@ const FileBrowser: React.FC<FileBrowserProps> = ({ serverUrl, onPlay, onCancel }
       </div>
 
       {/* Breadcrumb / Up */}
-      {currentPath && (
-        <button 
-          onClick={handleUpLevel}
-          className="flex items-center gap-3 p-4 border-b border-neutral-800 hover:bg-neutral-800 transition-colors shrink-0"
-        >
-          <div className="w-10 h-10 bg-neutral-700 rounded-lg flex items-center justify-center">
-            <Icons.Up className="w-6 h-6 text-neutral-400" />
-          </div>
-          <span className="font-medium text-neutral-300">.. (Up One Level)</span>
-        </button>
-      )}
+      <button 
+        onClick={handleUpLevel}
+        className="flex items-center gap-3 p-4 border-b border-neutral-800 hover:bg-neutral-800 transition-colors shrink-0"
+      >
+        <div className="w-10 h-10 bg-neutral-700 rounded-lg flex items-center justify-center">
+          <Icons.Up className="w-6 h-6 text-neutral-400" />
+        </div>
+        <span className="font-medium text-neutral-300">.. (Up One Level)</span>
+      </button>
 
       {/* List with Safe Area Bottom */}
       <div className="flex-1 overflow-y-auto p-2 space-y-1 pb-[env(safe-area-inset-bottom)]">
