@@ -4,6 +4,7 @@ import mimetypes
 import sqlite3
 import time
 import json
+from pathlib import Path
 from typing import List, Optional
 from contextlib import contextmanager, asynccontextmanager
 from functools import lru_cache
@@ -121,6 +122,51 @@ def load_playlist_from_db(client_ip: str) -> Optional[List[str]]:
                 return None
     return None
 
+def iter_image_files_safe(directory: str):
+    """
+    使用 pathlib 做鲁棒遍历：
+    - 遇到异常目录/条目时跳过，不中断全局扫描
+    - 忽略隐藏目录（名称以 . 开头）
+    """
+    base_dir = Path(directory)
+    if not base_dir.is_dir():
+        return
+
+    stack = [base_dir]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(current.iterdir())
+        except Exception as e:
+            print(f"⚠️ 跳过无法访问目录: {current} ({e})")
+            continue
+
+        for entry in entries:
+            try:
+                entry_name = entry.name
+            except Exception as e:
+                print(f"⚠️ 跳过异常目录项: {current} ({e})")
+                continue
+
+            try:
+                if entry.is_dir():
+                    if not entry_name.startswith('.'):
+                        stack.append(entry)
+                    continue
+            except Exception as e:
+                print(f"⚠️ 跳过无法判断目录项: {entry} ({e})")
+                continue
+
+            try:
+                if not entry.is_file():
+                    continue
+            except Exception as e:
+                print(f"⚠️ 跳过无法判断文件项: {entry} ({e})")
+                continue
+
+            if entry.suffix.lower() in ALLOWED_EXTENSIONS:
+                yield entry
+
 def scan_directory_for_images_lazy(directory: str) -> List[tuple[str, str]]:
     """
     轻量级扫描：仅列出文件名，返回相应的图片文件路径。
@@ -133,16 +179,9 @@ def scan_directory_for_images_lazy(directory: str) -> List[tuple[str, str]]:
     
     results = []
     try:
-        for root, dirs, files in os.walk(full_dir):
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
-            for filename in files:
-                ext = os.path.splitext(filename)[1].lower()
-                if ext not in ALLOWED_EXTENSIONS:
-                    continue
-                
-                file_path = os.path.join(root, filename)
-                rel_path = os.path.relpath(file_path, ROOT_DIR).replace('\\', '/')
-                results.append((filename, rel_path))
+        for file_path in iter_image_files_safe(full_dir):
+            rel_path = os.path.relpath(str(file_path), ROOT_DIR).replace('\\', '/')
+            results.append((file_path.name, rel_path))
     except Exception as e:
         print(f"❌ 轻量级扫描 {full_dir} 失败: {e}")
     
@@ -160,30 +199,23 @@ def scan_directory_for_images_heavy(directory: str) -> List[dict]:
     
     results = []
     try:
-        for root, dirs, files in os.walk(full_dir):
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
-            for filename in files:
-                ext = os.path.splitext(filename)[1].lower()
-                if ext not in ALLOWED_EXTENSIONS:
-                    continue
-                
-                file_path = os.path.join(root, filename)
-                try:
-                    mtime = os.path.getmtime(file_path)
-                    with Image.open(file_path) as img:
-                        width, height = img.size
-                        is_landscape = width >= height
-                        
-                        rel_path = os.path.relpath(file_path, ROOT_DIR).replace('\\', '/')
-                        results.append({
-                            'path': rel_path,
-                            'mtime': mtime,
-                            'width': width,
-                            'height': height,
-                            'is_landscape': is_landscape
-                        })
-                except Exception as e:
-                    print(f"⚠️ 无法读取图片 {file_path}: {e}")
+        for file_path in iter_image_files_safe(full_dir):
+            try:
+                mtime = file_path.stat().st_mtime
+                with Image.open(file_path) as img:
+                    width, height = img.size
+                    is_landscape = width >= height
+
+                    rel_path = os.path.relpath(str(file_path), ROOT_DIR).replace('\\', '/')
+                    results.append({
+                        'path': rel_path,
+                        'mtime': mtime,
+                        'width': width,
+                        'height': height,
+                        'is_landscape': is_landscape
+                    })
+            except Exception as e:
+                print(f"⚠️ 无法读取图片 {file_path}: {e}")
     except Exception as e:
         print(f"❌ 完整扫描 {full_dir} 失败: {e}")
     
@@ -331,14 +363,13 @@ def scan_library_task():
     changes = 0
     
     fs_files = {}
-    for root, _, files in os.walk(ROOT_DIR):
-        for filename in files:
-            ext = os.path.splitext(filename)[1].lower()
-            if ext in ALLOWED_EXTENSIONS:
-                abs_path = os.path.join(root, filename)
-                rel_path = os.path.relpath(abs_path, ROOT_DIR).replace('\\', '/')
-                mtime = os.path.getmtime(abs_path)
-                fs_files[rel_path] = mtime
+    for file_path in iter_image_files_safe(ROOT_DIR):
+        try:
+            rel_path = os.path.relpath(str(file_path), ROOT_DIR).replace('\\', '/')
+            mtime = file_path.stat().st_mtime
+            fs_files[rel_path] = mtime
+        except Exception as e:
+            print(f"⚠️ 跳过无法读取文件状态: {file_path} ({e})")
 
     with get_db() as conn:
         cursor = conn.execute("SELECT path, mtime FROM images")
