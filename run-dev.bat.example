@@ -1,0 +1,43 @@
+@echo off
+chcp 65001 >nul
+setlocal enabledelayedexpansion
+
+set GALLERY_ROOT_DIR=
+set GALLERY_CERT_DIR=
+set GALLERY_HOST=0.0.0.0
+set GALLERY_PORT=
+set GALLERY_RELOAD=0
+set GALLERY_ALLOW_PARENT_DIR_ACCESS=0
+set SSL_CERT=
+set SSL_KEY=
+set FRONTEND_PORT=
+set FRONTEND_DIST=
+
+echo.
+echo =========================================
+echo  Gravity Gallery - Development Server
+echo =========================================
+echo.
+echo Frontend: https://<hostname>.local:%FRONTEND_PORT%
+echo Backend:  https://<hostname>.local:%GALLERY_PORT%
+echo Image Root: %GALLERY_ROOT_DIR%
+echo Certificates: %GALLERY_CERT_DIR%
+echo.
+
+echo Starting backend server...
+cd /d %~dp0
+start /b hypercorn server:app --bind %GALLERY_HOST%:%GALLERY_PORT% --keyfile "%SSL_KEY%" --certfile "%SSL_CERT%"
+
+echo Starting frontend server...
+start /b serve -s dist -l tcp://%GALLERY_HOST%:%FRONTEND_PORT% --ssl-cert "%SSL_CERT%" --ssl-key "%SSL_KEY%"
+
+echo.
+echo =========================================
+echo  Both servers are running in background
+echo  Press Ctrl+C to stop all servers
+echo =========================================
+echo.
+
+:loop
+timeout /t 1 >nul
+goto loop

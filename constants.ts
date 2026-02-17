@@ -13,9 +13,11 @@ export const DEFAULT_CONFIG: AppConfig = {
     controlRevealMode: ControlRevealMode.Tap,
 };
 
-export const DEFAULT_SERVER_HOSTNAME = '<hostname>';
-export const DEFAULT_SERVER_URL = `https://${DEFAULT_SERVER_HOSTNAME}.local:4860`;
-// You can change this IP to match your computer's local IP
-export const FALLBACK_SERVER_URL = 'https://<ip>:4860';
+
+export const DEFAULT_SERVER_HOSTNAME = process.env.VITE_DEFAULT_SERVER_HOSTNAME;
+export const DEFAULT_SERVER_PORT = process.env.VITE_DEFAULT_SERVER_PORT;
+export const DEFAULT_SERVER_URL = `https://${DEFAULT_SERVER_HOSTNAME}.local:${DEFAULT_SERVER_PORT}`;
+
+export const FALLBACK_SERVER_URL = process.env.VITE_FALLBACK_SERVER_URL
 
 export const SUPPORTED_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg'];
