@@ -890,9 +890,35 @@ async def serve_file(file_path: str, request: Request, background_tasks: Backgro
     return await serve_file_core(file_path, request, background_tasks)
 
 
-# --- 启动方式 ---
+# # --- 启动方式 ---
+# if __name__ == "__main__":
+#     import socket
+#     def get_ip():
+#         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+#         try:
+#             s.connect(('10.255.255.255', 1))
+#             IP = s.getsockname()[0]
+#         except Exception:
+#             IP = '127.0.0.1'
+#         finally:
+#             s.close()
+#         return IP
+    
+#     ip = get_ip()
+#     port = 4860
+#     print("\n🚀 数据库增强版服务器已准备就绪 (支持 Playlist 持久化)")
+#     print(f"   请在终端中使用以下命令启动:")
+#     print(f"\n   uvicorn main:app --host 0.0.0.0 --port {port} --workers 1 --reload\n")
+#     print(f"   本地访问: http://127.0.0.1:{port}")
+#     print(f"   局域网访问: http://{ip}:{port}")
+
+import asyncio
+from hypercorn.config import Config
+from hypercorn.asyncio import serve
+
 if __name__ == "__main__":
     import socket
+
     def get_ip():
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -903,11 +929,21 @@ if __name__ == "__main__":
         finally:
             s.close()
         return IP
-    
+
     ip = get_ip()
     port = 4860
-    print("\n🚀 数据库增强版服务器已准备就绪 (支持 Playlist 持久化)")
-    print(f"   请在终端中使用以下命令启动:")
-    print(f"\n   uvicorn main:app --host 0.0.0.0 --port {port} --workers 1 --reload\n")
-    print(f"   本地访问: http://127.0.0.1:{port}")
-    print(f"   局域网访问: http://{ip}:{port}")
+
+    # Hypercorn 配置
+    config = Config()
+    config.bind = [f"0.0.0.0:{port}"]
+    config.keyfile = SSL_KEY_FILE
+    config.certfile = SSL_CERT_FILE
+    
+    # 强制启用 HTTP/2
+    config.alpn_protocols = ["h2", "http/1.1"]
+
+    print(f"\n🚀 Hypercorn HTTP/2 服务器启动中...")
+    print(f"   局域网访问: https://{ip}:{port}")
+
+    # 使用 asyncio 运行 Hypercorn
+    asyncio.run(serve(app, config))
