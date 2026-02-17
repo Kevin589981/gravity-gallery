@@ -9,7 +9,10 @@ import SettingsModal from './components/SettingsModal';
 import { Icons } from './components/Icon';
 
 const STORAGE_KEY = 'gravity_gallery_state_v1';
-const PRELOAD_BATCH_SIZE = 5;
+const MIN_PRELOAD_COUNT = 1;
+const MAX_PRELOAD_COUNT = 20;
+const MIN_CACHE_RESERVE_COUNT = 0;
+const MAX_CACHE_RESERVE_COUNT = 100;
 
 const App: React.FC = () => {
     const [allImages, setAllImages] = useState<ImageFile[]>([]);
@@ -24,6 +27,8 @@ const App: React.FC = () => {
     const uiTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const preloadInProgress = useRef<Set<string>>(new Set());
+    const preloadedBlobCache = useRef<Map<string, { blobUrl: string; isLandscape: boolean }>>(new Map());
+    const allImagesRef = useRef<ImageFile[]>([]);
     const playlistVersionRef = useRef(0);
     const playlistFetchSeqRef = useRef(0);
     const pendingServerFetchRef = useRef<{
@@ -37,6 +42,43 @@ const App: React.FC = () => {
     
     // 用于防止在设置更改时 useEffect 多次触发 fetch
     const fetchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    const clampPreloadCount = (value: number) => {
+        if (!Number.isFinite(value)) return DEFAULT_CONFIG.preloadCount;
+        return Math.max(MIN_PRELOAD_COUNT, Math.min(MAX_PRELOAD_COUNT, Math.floor(value)));
+    };
+
+    const clampCacheReserveCount = (value: number) => {
+        if (!Number.isFinite(value)) return DEFAULT_CONFIG.cacheReserveCount;
+        return Math.max(MIN_CACHE_RESERVE_COUNT, Math.min(MAX_CACHE_RESERVE_COUNT, Math.floor(value)));
+    };
+
+    const releaseServerBlobUrls = useCallback((images: ImageFile[]) => {
+        images.forEach((img) => {
+            if (img.blobUrl && !img.file) {
+                URL.revokeObjectURL(img.blobUrl);
+            }
+        });
+    }, []);
+
+    const clearPreloadedBlobCache = useCallback(() => {
+        preloadedBlobCache.current.forEach(({ blobUrl }) => {
+            URL.revokeObjectURL(blobUrl);
+        });
+        preloadedBlobCache.current.clear();
+    }, []);
+
+    useEffect(() => {
+        allImagesRef.current = allImages;
+    }, [allImages]);
+
+    useEffect(() => {
+        return () => {
+            releaseServerBlobUrls(allImagesRef.current);
+            clearPreloadedBlobCache();
+            preloadInProgress.current.clear();
+        };
+    }, [clearPreloadedBlobCache, releaseServerBlobUrls]);
 
     // Persistence: Load on mount
     useEffect(() => {
@@ -131,23 +173,43 @@ const App: React.FC = () => {
         // from being applied after a playlist refresh.
         const playlistVersion = playlistVersionRef.current;
 
-        const indicesToPreload: number[] = [];
-        for (let i = 1; i <= PRELOAD_BATCH_SIZE; i++) {
+        const preloadCount = clampPreloadCount(config.preloadCount);
+        const indicesToPreload = new Set<number>();
+        for (let i = 1; i <= preloadCount; i++) {
             const nextIdx = (currentIndex + i) % allImages.length;
-            const img = allImages[nextIdx];
-            if (img && !img.blobUrl && !preloadInProgress.current.has(img.id)) {
-                indicesToPreload.push(nextIdx);
-            }
+            const prevIdx = (currentIndex - i + allImages.length) % allImages.length;
+            indicesToPreload.add(nextIdx);
+            indicesToPreload.add(prevIdx);
         }
 
-        if (indicesToPreload.length === 0) return;
+        const preloadTargets = Array.from(indicesToPreload).filter((idx) => {
+            const img = allImages[idx];
+            return !!img && !img.blobUrl && !preloadInProgress.current.has(img.id);
+        });
 
-        indicesToPreload.forEach(async (idx) => {
+        if (preloadTargets.length === 0) return;
+
+        preloadTargets.forEach(async (idx) => {
             const img = allImages[idx];
             if (!img) return;
+
+            const cached = preloadedBlobCache.current.get(img.url);
+            if (cached) {
+                if (playlistVersionRef.current !== playlistVersion) return;
+                setAllImages(prev => {
+                    const newArr = [...prev];
+                    if (newArr[idx] && newArr[idx].id === img.id && !newArr[idx].blobUrl) {
+                        newArr[idx] = { ...newArr[idx], blobUrl: cached.blobUrl, isLandscape: cached.isLandscape, dimsLoaded: true };
+                    }
+                    return newArr;
+                });
+                return;
+            }
+
             preloadInProgress.current.add(img.id);
             try {
                 const { blobUrl, isLandscape } = await preloadImageAsBlob(img.url);
+                preloadedBlobCache.current.set(img.url, { blobUrl, isLandscape });
 
                 // If playlist changed while we were preloading, drop the result.
                 if (playlistVersionRef.current !== playlistVersion) return;
@@ -167,7 +229,62 @@ const App: React.FC = () => {
                 preloadInProgress.current.delete(img.id);
             }
         });
-    }, [currentIndex, allImages]);
+    }, [currentIndex, allImages, config.preloadCount]);
+
+    // Keep memory bounded: retain only nearby server blobs and cache entries.
+    useEffect(() => {
+        if (allImages.length === 0) return;
+
+        const preloadCount = clampPreloadCount(config.preloadCount);
+        const cacheReserveCount = clampCacheReserveCount(config.cacheReserveCount);
+        const keepRadius = preloadCount + cacheReserveCount;
+        const keepIndices = new Set<number>([currentIndex]);
+
+        for (let i = 1; i <= keepRadius; i++) {
+            keepIndices.add((currentIndex + i) % allImages.length);
+            keepIndices.add((currentIndex - i + allImages.length) % allImages.length);
+        }
+
+        const keepSourceUrls = new Set<string>();
+        keepIndices.forEach((idx) => {
+            const img = allImages[idx];
+            if (img) keepSourceUrls.add(img.url);
+        });
+
+        const blobUrlsToRevoke = new Set<string>();
+        let shouldStripBlobFromState = false;
+
+        allImages.forEach((img, idx) => {
+            if (!img.blobUrl || img.file) return;
+            if (!keepIndices.has(idx)) {
+                shouldStripBlobFromState = true;
+                blobUrlsToRevoke.add(img.blobUrl);
+            }
+        });
+
+        preloadedBlobCache.current.forEach((cached, sourceUrl) => {
+            if (!keepSourceUrls.has(sourceUrl)) {
+                blobUrlsToRevoke.add(cached.blobUrl);
+                preloadedBlobCache.current.delete(sourceUrl);
+            }
+        });
+
+        if (shouldStripBlobFromState) {
+            setAllImages((prev) => {
+                let changed = false;
+                const next = prev.map((img, idx) => {
+                    if (!img.blobUrl || img.file || keepIndices.has(idx)) return img;
+                    changed = true;
+                    return { ...img, blobUrl: undefined };
+                });
+                return changed ? next : prev;
+            });
+        }
+
+        if (blobUrlsToRevoke.size > 0) {
+            blobUrlsToRevoke.forEach((blobUrl) => URL.revokeObjectURL(blobUrl));
+        }
+    }, [allImages, currentIndex, config.preloadCount, config.cacheReserveCount]);
 
 
     // --- Core Functions ---
@@ -182,6 +299,8 @@ const App: React.FC = () => {
         const fetchSeq = ++playlistFetchSeqRef.current;
         setIsLoading(true);
         preloadInProgress.current.clear();
+        releaseServerBlobUrls(allImagesRef.current);
+        clearPreloadedBlobCache();
 
         try {
             const base = url.endsWith('/') ? url.slice(0, -1) : url;
@@ -217,7 +336,10 @@ const App: React.FC = () => {
 
             if (relPaths.length === 0) {
                 playlistVersionRef.current += 1;
-                setAllImages([]);
+                setAllImages(prev => {
+                    releaseServerBlobUrls(prev);
+                    return [];
+                });
                 setNoMatchesFound(true);
             } else {
                 const imageObjects = relPaths.map(relPath => ({
@@ -227,7 +349,10 @@ const App: React.FC = () => {
                     isLandscape: false
                 }));
                 playlistVersionRef.current += 1;
-                setAllImages(imageObjects);
+                setAllImages(prev => {
+                    releaseServerBlobUrls(prev);
+                    return imageObjects;
+                });
                 setCurrentIndex(0);
                 setNoMatchesFound(false);
             }
@@ -245,6 +370,7 @@ const App: React.FC = () => {
         if (!e.target.files || e.target.files.length === 0) return;
         setIsLoading(true);
         preloadInProgress.current.clear();
+        clearPreloadedBlobCache();
 
         const validFiles = Array.from(e.target.files).filter(isImageFile);
         if (validFiles.length === 0) {
@@ -258,7 +384,10 @@ const App: React.FC = () => {
         if (config.sortDirection === SortDirection.Reverse) sorted.reverse();
 
         playlistVersionRef.current += 1;
-        setAllImages(sorted);
+        setAllImages(prev => {
+            releaseServerBlobUrls(prev);
+            return sorted;
+        });
         setConfig(prev => ({ ...prev, serverUrl: undefined, selectedServerPaths: undefined }));
         setCurrentIndex(0);
         setNoMatchesFound(false);
@@ -275,10 +404,14 @@ const App: React.FC = () => {
     const loadDemoImages = async () => {
         setIsLoading(true);
         preloadInProgress.current.clear();
+        clearPreloadedBlobCache();
         const demoUrls = ['https://picsum.photos/1920/1080', 'https://picsum.photos/1080/1920', 'https://picsum.photos/2000/3000', 'https://picsum.photos/3000/2000', 'https://picsum.photos/1500/1500'];
         const processed = await Promise.all(demoUrls.map((u, i) => createImageObject(`${u}?r=${i}`)));
         playlistVersionRef.current += 1;
-        setAllImages(shuffleArray(processed));
+        setAllImages(prev => {
+            releaseServerBlobUrls(prev);
+            return shuffleArray(processed);
+        });
         setConfig(prev => ({ ...prev, serverUrl: undefined, selectedServerPaths: undefined }));
         setCurrentIndex(0);
         setNoMatchesFound(false);
@@ -367,7 +500,7 @@ const App: React.FC = () => {
                 </div>
                 <button onClick={() => setShowSettings(true)} className="bg-blue-600 px-6 py-3 rounded-xl font-bold text-white hover:bg-blue-500 transition-colors">Open Settings</button>
                 <SettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} config={config} onConfigChange={setConfig} fileCount={allImages.length}
-                    onReselectFolder={() => { setAllImages([]); setShowSettings(false); localStorage.removeItem(STORAGE_KEY); preloadInProgress.current.clear(); }}
+                    onReselectFolder={() => { setAllImages(prev => { releaseServerBlobUrls(prev); return []; }); setShowSettings(false); setNoMatchesFound(false); localStorage.removeItem(STORAGE_KEY); preloadInProgress.current.clear(); clearPreloadedBlobCache(); }}
                 />
             </div>
         )
@@ -388,7 +521,7 @@ const App: React.FC = () => {
                 </button>
             )}
             <SettingsModal isOpen={showSettings} onClose={() => { setShowSettings(false); setIsPaused(false); resetUITimer(); }} config={config} onConfigChange={setConfig} fileCount={allImages.length}
-                onReselectFolder={() => { setAllImages([]); setShowSettings(false); localStorage.removeItem(STORAGE_KEY); preloadInProgress.current.clear(); }}
+                onReselectFolder={() => { setAllImages(prev => { releaseServerBlobUrls(prev); return []; }); setShowSettings(false); setNoMatchesFound(false); localStorage.removeItem(STORAGE_KEY); preloadInProgress.current.clear(); clearPreloadedBlobCache(); }}
             />
         </div>
     );

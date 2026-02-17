@@ -2,6 +2,8 @@ import { AppConfig, FitMode, SortMode, SortDirection, OrientationFilter, Control
 
 export const DEFAULT_CONFIG: AppConfig = {
     refreshInterval: 5,
+    preloadCount: 5,
+    cacheReserveCount: 20,
     fitMode: FitMode.Contain,
     autoRotate: true,
     showInfo: true,

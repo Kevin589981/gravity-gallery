@@ -228,6 +228,46 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
                                 <span>30s</span>
                                 <span>60s</span>
                             </div>
+
+                            <div className="pt-2">
+                                <div className="flex justify-between">
+                                    <span className="text-neutral-200">Preload (each side)</span>
+                                    <span className="text-blue-400 font-mono">{config.preloadCount}</span>
+                                </div>
+                                <input
+                                    type="range"
+                                    min="1"
+                                    max="20"
+                                    value={config.preloadCount}
+                                    onChange={(e) => updateConfig('preloadCount', parseInt(e.target.value))}
+                                    className="w-full h-2 bg-neutral-700 rounded-lg appearance-none cursor-pointer accent-blue-600 mt-2"
+                                />
+                                <div className="flex justify-between text-xs text-neutral-500 mt-1">
+                                    <span>1</span>
+                                    <span>10</span>
+                                    <span>20</span>
+                                </div>
+                            </div>
+
+                            <div className="pt-2">
+                                <div className="flex justify-between">
+                                    <span className="text-neutral-200">Cache Reserve (each side)</span>
+                                    <span className="text-blue-400 font-mono">{config.cacheReserveCount}</span>
+                                </div>
+                                <input
+                                    type="range"
+                                    min="0"
+                                    max="100"
+                                    value={config.cacheReserveCount}
+                                    onChange={(e) => updateConfig('cacheReserveCount', parseInt(e.target.value))}
+                                    className="w-full h-2 bg-neutral-700 rounded-lg appearance-none cursor-pointer accent-blue-600 mt-2"
+                                />
+                                <div className="flex justify-between text-xs text-neutral-500 mt-1">
+                                    <span>0</span>
+                                    <span>50</span>
+                                    <span>100</span>
+                                </div>
+                            </div>
                         </div>
 
                         {/* Sort Mode Section - Enhanced with all 5 modes */}

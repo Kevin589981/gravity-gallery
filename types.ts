@@ -29,6 +29,8 @@ export enum ControlRevealMode {
 
 export interface AppConfig {
     refreshInterval: number; // in seconds
+    preloadCount: number; // Number of images to preload on each side of current image
+    cacheReserveCount: number; // Extra number of images kept on each side in cache window
     fitMode: FitMode;
     autoRotate: boolean; // If true, rotates landscape images on portrait screens
     showInfo: boolean;
