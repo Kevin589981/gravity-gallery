@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import List, Optional
 from contextlib import contextmanager, asynccontextmanager
 from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,6 +32,19 @@ def env_to_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+def env_to_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, parsed))
+
+DEFAULT_SCAN_WORKERS = min(16, max(1, (os.cpu_count() or 4) * 2))
+SCAN_WORKERS = env_to_int("GALLERY_SCAN_WORKERS", DEFAULT_SCAN_WORKERS, 1, 32)
 
 def allow_parent_dir_access() -> bool:
     """热读取父目录访问开关。"""
@@ -167,6 +181,28 @@ def iter_image_files_safe(directory: str):
             if entry.suffix.lower() in ALLOWED_EXTENSIONS:
                 yield entry
 
+def process_image_metadata(file_path: Path, root_dir: str) -> Optional[dict]:
+    """线程池任务：读取单张图片元数据。"""
+    try:
+        stat = file_path.stat()
+        mtime = stat.st_mtime
+
+        with Image.open(file_path) as img:
+            width, height = img.size
+            is_landscape = width >= height
+
+        rel_path = os.path.relpath(str(file_path), root_dir).replace('\\', '/')
+        return {
+            'path': rel_path,
+            'mtime': mtime,
+            'width': width,
+            'height': height,
+            'is_landscape': is_landscape
+        }
+    except Exception as e:
+        print(f"⚠️ 无法读取图片 {file_path}: {e}")
+        return None
+
 def scan_directory_for_images_lazy(directory: str) -> List[tuple[str, str]]:
     """
     轻量级扫描：仅列出文件名，返回相应的图片文件路径。
@@ -196,28 +232,36 @@ def scan_directory_for_images_heavy(directory: str) -> List[dict]:
     full_dir = os.path.abspath(directory)
     if not os.path.isdir(full_dir):
         return []
-    
-    results = []
-    try:
-        for file_path in iter_image_files_safe(full_dir):
-            try:
-                mtime = file_path.stat().st_mtime
-                with Image.open(file_path) as img:
-                    width, height = img.size
-                    is_landscape = width >= height
 
-                    rel_path = os.path.relpath(str(file_path), ROOT_DIR).replace('\\', '/')
-                    results.append({
-                        'path': rel_path,
-                        'mtime': mtime,
-                        'width': width,
-                        'height': height,
-                        'is_landscape': is_landscape
-                    })
-            except Exception as e:
-                print(f"⚠️ 无法读取图片 {file_path}: {e}")
+    try:
+        all_files = list(iter_image_files_safe(full_dir))
     except Exception as e:
         print(f"❌ 完整扫描 {full_dir} 失败: {e}")
+        return []
+
+    if not all_files:
+        return []
+
+    results = []
+    max_workers = min(SCAN_WORKERS, len(all_files))
+    print(f"🧵 并发扫描目录: {full_dir} | 文件数 {len(all_files)} | 线程数 {max_workers}")
+
+    if max_workers <= 1:
+        for file_path in all_files:
+            metadata = process_image_metadata(file_path, ROOT_DIR)
+            if metadata:
+                results.append(metadata)
+        return results
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(process_image_metadata, file_path, ROOT_DIR) for file_path in all_files]
+        for future in as_completed(futures):
+            try:
+                metadata = future.result()
+                if metadata:
+                    results.append(metadata)
+            except Exception as e:
+                print(f"⚠️ 并发任务异常（已忽略）: {e}")
     
     return results
 
@@ -367,25 +411,52 @@ def scan_library_task():
         try:
             rel_path = os.path.relpath(str(file_path), ROOT_DIR).replace('\\', '/')
             mtime = file_path.stat().st_mtime
-            fs_files[rel_path] = mtime
+            fs_files[rel_path] = (file_path, mtime)
         except Exception as e:
             print(f"⚠️ 跳过无法读取文件状态: {file_path} ({e})")
 
     with get_db() as conn:
         cursor = conn.execute("SELECT path, mtime FROM images")
         db_files = {row['path']: row['mtime'] for row in cursor}
-        
+
+        files_to_update = [
+            file_path
+            for path, (file_path, mtime) in fs_files.items()
+            if path not in db_files or db_files[path] != mtime
+        ]
+
         to_upsert = []
-        for path, mtime in fs_files.items():
-            if path not in db_files or db_files[path] != mtime:
-                try:
-                    full_path = os.path.join(ROOT_DIR, path)
-                    with Image.open(full_path) as img:
-                        width, height = img.size
-                        is_landscape = width >= height
-                        to_upsert.append((path, mtime, width, height, is_landscape))
-                except Exception as e:
-                    print(f"❌ 无法读取图片 {path}: {e}")
+        if files_to_update:
+            max_workers = min(SCAN_WORKERS, len(files_to_update))
+            print(f"🚀 检测到 {len(files_to_update)} 个变动文件，开始并发解析（线程数 {max_workers}）...")
+
+            if max_workers <= 1:
+                for file_path in files_to_update:
+                    metadata = process_image_metadata(file_path, ROOT_DIR)
+                    if metadata:
+                        to_upsert.append((
+                            metadata['path'],
+                            metadata['mtime'],
+                            metadata['width'],
+                            metadata['height'],
+                            metadata['is_landscape']
+                        ))
+            else:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = [executor.submit(process_image_metadata, file_path, ROOT_DIR) for file_path in files_to_update]
+                    for future in as_completed(futures):
+                        try:
+                            metadata = future.result()
+                            if metadata:
+                                to_upsert.append((
+                                    metadata['path'],
+                                    metadata['mtime'],
+                                    metadata['width'],
+                                    metadata['height'],
+                                    metadata['is_landscape']
+                                ))
+                        except Exception as e:
+                            print(f"⚠️ 并发任务异常（已忽略）: {e}")
 
         # 仅清理 ROOT_DIR 内失效文件。ROOT_DIR 外的条目保持不动，等待用户再次访问该目录时按需刷新。
         to_delete = [
