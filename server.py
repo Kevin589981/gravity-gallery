@@ -384,7 +384,7 @@ def preload_surrounding_images(playlist: List[str], current_index: int):
     if playlist_len == 0:
         return
 
-    preload_window = 300
+    preload_window = 100 # 300
     print(f"🔥 后台回绕预加载任务启动: 当前索引 {current_index}, 窗口大小 ±{preload_window}")
     
     loaded_count = 0
@@ -865,7 +865,7 @@ async def serve_file_core(path_value: str, request: Request, background_tasks: B
 
     if session:
         session.request_count += 1
-        if session.request_count % 280 == 1:
+        if session.request_count % 90 == 1:
             session.request_count = 1
             try:
                 current_index = session.playlist.index(rel_path)
