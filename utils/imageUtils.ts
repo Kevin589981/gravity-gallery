@@ -95,9 +95,24 @@ export const createImageObject = (source: File | string): Promise<ImageFile> => 
     });
 };
 
-export const preloadImageAsBlob = async (url: string): Promise<{ blobUrl: string; isLandscape: boolean }> => {
+type FetchPriorityHint = 'high' | 'low' | 'auto';
+
+interface PreloadImageOptions {
+    priority?: FetchPriorityHint;
+    signal?: AbortSignal;
+}
+
+export const preloadImageAsBlob = async (
+    url: string,
+    options: PreloadImageOptions = {}
+): Promise<{ blobUrl: string; isLandscape: boolean }> => {
     try {
-        const response = await fetch(url);
+        const requestOptions: RequestInit & { priority?: FetchPriorityHint } = {
+            priority: options.priority ?? 'low',
+            signal: options.signal,
+        };
+
+        const response = await fetch(url, requestOptions);
         const blob = await response.blob();
         const blobUrl = URL.createObjectURL(blob);
 

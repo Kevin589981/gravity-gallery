@@ -293,6 +293,7 @@ const SingleImageView = ({ image, config, windowSize, onLoad }: any) => {
         className={`${config.fitMode === FitMode.Cover ? 'object-cover w-full h-full' : 'object-contain max-w-full max-h-full'}`}
         draggable={false}
         loading="eager"
+        fetchPriority="high"
         decoding="sync"
         onLoad={(e) => {
           const isL = e.currentTarget.naturalWidth >= e.currentTarget.naturalHeight;

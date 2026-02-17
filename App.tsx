@@ -13,6 +13,7 @@ const MIN_PRELOAD_COUNT = 1;
 const MAX_PRELOAD_COUNT = 20;
 const MIN_CACHE_RESERVE_COUNT = 0;
 const MAX_CACHE_RESERVE_COUNT = 100;
+const PRELOAD_CONCURRENCY = 2;
 
 const App: React.FC = () => {
     const [allImages, setAllImages] = useState<ImageFile[]>([]);
@@ -28,6 +29,7 @@ const App: React.FC = () => {
     const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const preloadInProgress = useRef<Set<string>>(new Set());
     const preloadedBlobCache = useRef<Map<string, { blobUrl: string; isLandscape: boolean }>>(new Map());
+    const preloadScheduleTokenRef = useRef(0);
     const allImagesRef = useRef<ImageFile[]>([]);
     const playlistVersionRef = useRef(0);
     const playlistFetchSeqRef = useRef(0);
@@ -168,28 +170,35 @@ const App: React.FC = () => {
     // --- Preload Logic ---
     useEffect(() => {
         if (allImages.length === 0) return;
+        const scheduleToken = ++preloadScheduleTokenRef.current;
 
         // Capture the current playlist version to prevent stale preload results
         // from being applied after a playlist refresh.
         const playlistVersion = playlistVersionRef.current;
 
         const preloadCount = clampPreloadCount(config.preloadCount);
-        const indicesToPreload = new Set<number>();
+        const seenIndices = new Set<number>();
+        const orderedIndices: number[] = [];
         for (let i = 1; i <= preloadCount; i++) {
             const nextIdx = (currentIndex + i) % allImages.length;
             const prevIdx = (currentIndex - i + allImages.length) % allImages.length;
-            indicesToPreload.add(nextIdx);
-            indicesToPreload.add(prevIdx);
+
+            if (!seenIndices.has(nextIdx)) {
+                seenIndices.add(nextIdx);
+                orderedIndices.push(nextIdx);
+            }
+            if (!seenIndices.has(prevIdx)) {
+                seenIndices.add(prevIdx);
+                orderedIndices.push(prevIdx);
+            }
         }
 
-        const preloadTargets = Array.from(indicesToPreload).filter((idx) => {
+        const preloadTargets = orderedIndices.filter((idx) => {
             const img = allImages[idx];
             return !!img && !img.blobUrl && !preloadInProgress.current.has(img.id);
         });
 
-        if (preloadTargets.length === 0) return;
-
-        preloadTargets.forEach(async (idx) => {
+        const preloadAtIndex = async (idx: number, priority: 'high' | 'low') => {
             const img = allImages[idx];
             if (!img) return;
 
@@ -206,9 +215,14 @@ const App: React.FC = () => {
                 return;
             }
 
+            if (preloadInProgress.current.has(img.id)) return;
+
             preloadInProgress.current.add(img.id);
             try {
-                const { blobUrl, isLandscape } = await preloadImageAsBlob(img.url);
+                const { blobUrl, isLandscape } = await preloadImageAsBlob(img.url, {
+                    priority,
+                });
+
                 preloadedBlobCache.current.set(img.url, { blobUrl, isLandscape });
 
                 // If playlist changed while we were preloading, drop the result.
@@ -221,14 +235,45 @@ const App: React.FC = () => {
                     }
                     return newArr;
                 });
-            } catch (e) {
-                // ignore
+            } catch (e: any) {
             } finally {
                 // Always release the lock. Otherwise a playlist refresh can make an image
                 // permanently appear "in-progress" even if its blobUrl was never attached.
                 preloadInProgress.current.delete(img.id);
             }
-        });
+        };
+
+        const preloadWithPriority = async () => {
+            if (preloadTargets.length === 0) return;
+            if (scheduleToken !== preloadScheduleTokenRef.current) return;
+
+            const [firstIdx, ...restIndices] = preloadTargets;
+            if (firstIdx !== undefined) {
+                await preloadAtIndex(firstIdx, 'high');
+            }
+
+            if (restIndices.length === 0) return;
+            if (scheduleToken !== preloadScheduleTokenRef.current) return;
+
+            const workerCount = Math.max(1, Math.min(PRELOAD_CONCURRENCY, restIndices.length));
+            let cursor = 0;
+
+            const worker = async () => {
+                while (scheduleToken === preloadScheduleTokenRef.current) {
+                    const idx = restIndices[cursor++];
+                    if (idx === undefined) break;
+                    await preloadAtIndex(idx, 'low');
+                }
+            };
+
+            await Promise.all(Array.from({ length: workerCount }, () => worker()));
+        };
+
+        void preloadWithPriority();
+
+        return () => {
+            // 只停止旧批次继续派发，不中断已在进行的下载，避免重复下载与黑屏。
+        };
     }, [currentIndex, allImages, config.preloadCount]);
 
     // Keep memory bounded: retain only nearby server blobs and cache entries.
@@ -298,6 +343,7 @@ const App: React.FC = () => {
     ) => {
         const fetchSeq = ++playlistFetchSeqRef.current;
         setIsLoading(true);
+        preloadScheduleTokenRef.current += 1;
         preloadInProgress.current.clear();
         releaseServerBlobUrls(allImagesRef.current);
         clearPreloadedBlobCache();
@@ -369,6 +415,7 @@ const App: React.FC = () => {
     const handleFolderSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
         if (!e.target.files || e.target.files.length === 0) return;
         setIsLoading(true);
+        preloadScheduleTokenRef.current += 1;
         preloadInProgress.current.clear();
         clearPreloadedBlobCache();
 
@@ -403,6 +450,7 @@ const App: React.FC = () => {
 
     const loadDemoImages = async () => {
         setIsLoading(true);
+        preloadScheduleTokenRef.current += 1;
         preloadInProgress.current.clear();
         clearPreloadedBlobCache();
         const demoUrls = ['https://picsum.photos/1920/1080', 'https://picsum.photos/1080/1920', 'https://picsum.photos/2000/3000', 'https://picsum.photos/3000/2000', 'https://picsum.photos/1500/1500'];
