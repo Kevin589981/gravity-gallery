@@ -35,6 +35,7 @@ struct AppState {
     root_dir: Arc<PathBuf>,
     allow_parent_dir_access: Arc<RwLock<bool>>,
     external_synced_paths_this_boot: Arc<RwLock<HashSet<String>>>,
+    log_api_file_requests: bool,
 }
 
 // --- 数据模型 ---
@@ -128,6 +129,17 @@ fn normalize_rel_path(path: &str) -> String {
 
 fn resolve_full_path(root_dir: &Path, rel_path: &str) -> PathBuf {
     root_dir.join(rel_path).clean()
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    env::var(name)
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn is_under_root(root_dir: &Path, full_path: &Path) -> bool {
@@ -800,6 +812,9 @@ async fn serve_file_by_query(
     State(state): State<AppState>,
     Query(query): Query<FileQuery>,
 ) -> Response {
+    if state.log_api_file_requests {
+        println!("📷 [API /api/file] path={}", query.path);
+    }
     serve_file_core(state, query.path).await
 }
 
@@ -963,7 +978,13 @@ async fn main() -> Result<()> {
         root_dir: Arc::new(root_dir.clone()),
         allow_parent_dir_access: Arc::new(RwLock::new(env::var("GALLERY_ALLOW_PARENT_DIR_ACCESS").unwrap_or_default() == "1")),
         external_synced_paths_this_boot: Arc::new(RwLock::new(HashSet::new())),
+        log_api_file_requests: env_flag_enabled("GALLERY_LOG_API_FILE_REQUESTS"),
     };
+
+    println!(
+        "📝 API /api/file request logging: {}",
+        if app_state.log_api_file_requests { "ON" } else { "OFF" }
+    );
 
     // 启动时触发一次扫描
     let state_clone = app_state.clone();
