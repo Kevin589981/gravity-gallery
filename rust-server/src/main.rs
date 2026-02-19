@@ -1,6 +1,6 @@
 use anyhow::Result;
 use axum::{
-    extract::{ConnectInfo, Path as AxumPath, Query, State},
+    extract::{ConnectInfo, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -8,7 +8,6 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig;
 use futures::StreamExt;
-use image::GenericImageView;
 use mime_guess::from_path;
 use path_clean::PathClean;
 use pathdiff::diff_paths;
@@ -63,9 +62,31 @@ struct RestorePlaylistRequest {
 struct RuntimeConfigRequest {
     allow_parent_dir_access: bool,
 }
+
+#[derive(Debug, Deserialize)]
+struct BrowseQuery {
+    #[serde(default)]
+    path: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct FileQuery {
     path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowseItem {
+    name: String,
+    path: String,
+    #[serde(rename = "type")]
+    item_type: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowseResponse {
+    #[serde(rename = "currentPath")]
+    current_path: String,
+    items: Vec<BrowseItem>,
 }
 
 #[derive(Debug, Serialize)]
@@ -87,6 +108,13 @@ struct ImageMetadata {
 fn default_sort() -> String { "shuffle".to_string() }
 fn default_orientation() -> String { "Both".to_string() }
 fn default_direction() -> String { "forward".to_string() }
+
+fn path_to_rel_string(root_dir: &Path, full_path: &Path) -> String {
+    diff_paths(full_path, root_dir)
+        .unwrap_or_else(|| PathBuf::from(""))
+        .to_string_lossy()
+        .replace('\\', "/")
+}
 
 // --- 辅助函数 ---
 
@@ -216,6 +244,60 @@ async fn sync_external_path_to_db(pool: &Pool<Sqlite>, root_dir: &Path, rel_path
         scanned_paths.len(),
         deleted_count
     );
+
+    Ok(())
+}
+
+async fn upsert_missing_path_to_db(pool: &Pool<Sqlite>, root_dir: &Path, rel_path: &str) -> Result<()> {
+    let normalized = normalize_rel_path(rel_path);
+    if normalized.is_empty() || normalized == "." {
+        return Ok(());
+    }
+
+    let full_path = resolve_full_path(root_dir, &normalized);
+    if !full_path.exists() {
+        return Ok(());
+    }
+
+    let root_clone = root_dir.to_path_buf();
+    let scanned: Vec<ImageMetadata> = tokio::task::spawn_blocking(move || {
+        let mut results = Vec::new();
+
+        if full_path.is_file() {
+            if let Some(meta) = process_image_metadata_sync(&full_path, &root_clone) {
+                results.push(meta);
+            }
+            return results;
+        }
+
+        for entry in WalkDir::new(&full_path).into_iter().filter_map(|e| e.ok()) {
+            if entry.file_type().is_file() && is_image_ext(entry.path()) {
+                if let Some(meta) = process_image_metadata_sync(entry.path(), &root_clone) {
+                    results.push(meta);
+                }
+            }
+        }
+        results
+    })
+    .await
+    .unwrap_or_default();
+
+    if scanned.is_empty() {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+    for meta in scanned {
+        sqlx::query("INSERT OR REPLACE INTO images (path, mtime, width, height, is_landscape) VALUES (?, ?, ?, ?, ?)")
+            .bind(meta.path)
+            .bind(meta.mtime)
+            .bind(meta.width)
+            .bind(meta.height)
+            .bind(meta.is_landscape)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
 
     Ok(())
 }
@@ -431,6 +513,27 @@ async fn get_playlist(
         }
     }
 
+    let mut missing_paths = Vec::new();
+    for p in &valid_req_paths {
+        if p.is_empty() || p == "." {
+            continue;
+        }
+        let exists_row: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM images WHERE path LIKE ? LIMIT 1")
+            .bind(format!("{}/%", p))
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or(None);
+        if exists_row.is_none() {
+            missing_paths.push(p.clone());
+        }
+    }
+
+    for missing in missing_paths {
+        if let Err(err) = upsert_missing_path_to_db(&state.db, root_dir, &missing).await {
+            eprintln!("⚠️ Missing-path upsert failed for {}: {}", missing, err);
+        }
+    }
+
     // 2. 数据库查询 (直接利用 SQL 筛选，速度极快)
     // 注意：构建动态 LIKE 查询比较繁琐，这里简化为获取所有符合条件的然后内存过滤
     // 或者针对每个路径前缀查一次
@@ -562,7 +665,15 @@ async fn restore_playlist(
     State(state): State<AppState>,
     connect_info: ConnectInfo<SocketAddr>,
     Json(req): Json<RestorePlaylistRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let original_count = req.playlist.len();
+    if original_count == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "detail": "Playlist cannot be empty" })),
+        ));
+    }
+
     let root_dir = state.root_dir.as_path();
     let allow_parent = *state.allow_parent_dir_access.read().await;
 
@@ -578,6 +689,13 @@ async fn restore_playlist(
         }
     }
 
+    if valid_paths.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "detail": "No valid paths in playlist" })),
+        ));
+    }
+
     // 更新数据库会话
     let ip = connect_info.0.ip().to_string();
     if let Ok(json_playlist) = serde_json::to_string(&valid_paths) {
@@ -591,11 +709,15 @@ async fn restore_playlist(
             .ok();
     }
 
-    Json(serde_json::json!({
+    let current_index = req.current_index.min(valid_paths.len().saturating_sub(1));
+
+    Ok(Json(serde_json::json!({
         "status": "restored",
         "valid_count": valid_paths.len(),
+        "original_count": original_count,
+        "current_index": current_index,
         "playlist": valid_paths
-    }))
+    })))
 }
 
 async fn session_status(
@@ -689,15 +811,139 @@ async fn serve_file_by_query(
 //     serve_file_core(state, path_str).await
 // }
 
+async fn browse_folder(
+    State(state): State<AppState>,
+    Query(query): Query<BrowseQuery>,
+) -> Result<Json<BrowseResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let root_dir = state.root_dir.as_path();
+    let allow_parent = *state.allow_parent_dir_access.read().await;
+
+    let mut rel_path = normalize_rel_path(&query.path);
+    let mut target_path = if rel_path.is_empty() || rel_path == "." {
+        root_dir.to_path_buf()
+    } else {
+        resolve_full_path(root_dir, &rel_path)
+    };
+
+    if !allow_parent && !is_under_root(root_dir, &target_path) {
+        target_path = root_dir.to_path_buf();
+        rel_path.clear();
+    } else {
+        rel_path = path_to_rel_string(root_dir, &target_path);
+        if rel_path == "." {
+            rel_path.clear();
+        }
+    }
+
+    if !target_path.exists() || !target_path.is_dir() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "detail": "Folder not found" })),
+        ));
+    }
+
+    let mut items = Vec::new();
+    let entries = std::fs::read_dir(&target_path).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "detail": "Failed to read folder" })),
+        )
+    })?;
+
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+
+        let is_dir = ft.is_dir();
+        if !is_dir && !is_image_ext(&entry_path) {
+            continue;
+        }
+
+        items.push(BrowseItem {
+            name,
+            path: path_to_rel_string(root_dir, &entry_path),
+            item_type: if is_dir { "folder" } else { "file" }.to_string(),
+        });
+    }
+
+    items.sort_by(|a, b| {
+        let rank_a = if a.item_type == "folder" { 0 } else { 1 };
+        let rank_b = if b.item_type == "folder" { 0 } else { 1 };
+        rank_a
+            .cmp(&rank_b)
+            .then_with(|| natord::compare_ignore_case(&a.name, &b.name))
+    });
+
+    Ok(Json(BrowseResponse {
+        current_path: rel_path,
+        items,
+    }))
+}
+
 async fn get_runtime_config(State(state): State<AppState>) -> Json<serde_json::Value> {
     let v = *state.allow_parent_dir_access.read().await;
-    Json(serde_json::json!({ "allow_parent_dir_access": v }))
+    Json(serde_json::json!({
+        "allow_parent_dir_access": v,
+        "env_value": env::var("GALLERY_ALLOW_PARENT_DIR_ACCESS").unwrap_or_else(|_| "<unset>".to_string())
+    }))
+}
+
+async fn set_runtime_config(
+    State(state): State<AppState>,
+    Json(req): Json<RuntimeConfigRequest>,
+) -> Json<serde_json::Value> {
+    {
+        let mut guard = state.allow_parent_dir_access.write().await;
+        *guard = req.allow_parent_dir_access;
+    }
+    env::set_var(
+        "GALLERY_ALLOW_PARENT_DIR_ACCESS",
+        if req.allow_parent_dir_access { "1" } else { "0" },
+    );
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "allow_parent_dir_access": req.allow_parent_dir_access,
+        "env_value": env::var("GALLERY_ALLOW_PARENT_DIR_ACCESS").unwrap_or_else(|_| "<unset>".to_string())
+    }))
+}
+
+async fn toggle_runtime_config(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let new_value = {
+        let mut guard = state.allow_parent_dir_access.write().await;
+        *guard = !*guard;
+        *guard
+    };
+
+    env::set_var(
+        "GALLERY_ALLOW_PARENT_DIR_ACCESS",
+        if new_value { "1" } else { "0" },
+    );
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "allow_parent_dir_access": new_value,
+        "env_value": env::var("GALLERY_ALLOW_PARENT_DIR_ACCESS").unwrap_or_else(|_| "<unset>".to_string())
+    }))
 }
 
 // --- Main ---
 
 #[tokio::main]
 async fn main() -> Result<()> {
+        let host = env::var("GALLERY_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+        let port = env::var("GALLERY_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(4860);
+
     // 1. 环境配置
     let root_dir = env::var("GALLERY_ROOT_DIR").map(PathBuf::from).unwrap_or(env::current_dir()?);
     let db_path = root_dir.join("gallery_metadata.db");
@@ -728,10 +974,12 @@ async fn main() -> Result<()> {
     // 3. 路由
     let app = Router::new()
         .route("/api/scan", post(trigger_scan))
+        .route("/api/browse", get(browse_folder))
         .route("/api/playlist", post(get_playlist))
         .route("/api/restore-playlist", post(restore_playlist))
         .route("/api/session-status", get(session_status))
-        .route("/api/runtime-config", get(get_runtime_config))
+        .route("/api/runtime-config", get(get_runtime_config).post(set_runtime_config))
+        .route("/api/runtime-config/toggle", post(toggle_runtime_config))
         // --- 修复点开始 ---
         .route("/api/file", get(serve_file_by_query)) // 必须放在通配符之前
         // .route("/*file_path", get(serve_file_by_path))
@@ -740,7 +988,9 @@ async fn main() -> Result<()> {
         .with_state(app_state);
 
     // 4. 服务器启动 (Rustls)
-    let addr = SocketAddr::from(([0, 0, 0, 0], 4860));
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 4860)));
     println!("🚀 Rust Gallery Server running on https://{}", addr);
     
     // 加载证书部分省略，逻辑同上... 假设证书存在
