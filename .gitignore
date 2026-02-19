@@ -26,3 +26,4 @@ certificates/
 *.bat
 *.pyc
 .env
+*.exe
