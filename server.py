@@ -885,9 +885,9 @@ async def serve_file_core(path_value: str, request: Request, background_tasks: B
 async def serve_file_by_query(path: str, request: Request, background_tasks: BackgroundTasks):
     return await serve_file_core(path, request, background_tasks)
 
-@app.get("/{file_path:path}")
-async def serve_file(file_path: str, request: Request, background_tasks: BackgroundTasks):
-    return await serve_file_core(file_path, request, background_tasks)
+# @app.get("/{file_path:path}")
+# async def serve_file(file_path: str, request: Request, background_tasks: BackgroundTasks):
+#     return await serve_file_core(file_path, request, background_tasks)
 
 
 # # --- 启动方式 ---

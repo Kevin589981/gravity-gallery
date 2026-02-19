@@ -499,12 +499,12 @@ async fn serve_file_by_query(
 }
 
 /// 接口 2: 处理直接路径 /folder/image.jpg
-async fn serve_file_by_path(
-    State(state): State<AppState>,
-    AxumPath(path_str): AxumPath<String>,
-) -> Response {
-    serve_file_core(state, path_str).await
-}
+// async fn serve_file_by_path(
+//     State(state): State<AppState>,
+//     AxumPath(path_str): AxumPath<String>,
+// ) -> Response {
+//     serve_file_core(state, path_str).await
+// }
 
 async fn get_runtime_config(State(state): State<AppState>) -> Json<serde_json::Value> {
     let v = *state.allow_parent_dir_access.read().await;
@@ -550,7 +550,7 @@ async fn main() -> Result<()> {
         .route("/api/runtime-config", get(get_runtime_config))
         // --- 修复点开始 ---
         .route("/api/file", get(serve_file_by_query)) // 必须放在通配符之前
-        .route("/*file_path", get(serve_file_by_path))
+        // .route("/*file_path", get(serve_file_by_path))
         // --- 修复点结束 ---
         .layer(CorsLayer::permissive())
         .with_state(app_state);
