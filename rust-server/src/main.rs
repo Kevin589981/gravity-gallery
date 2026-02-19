@@ -35,6 +35,7 @@ struct AppState {
     db: Pool<Sqlite>,
     root_dir: Arc<PathBuf>,
     allow_parent_dir_access: Arc<RwLock<bool>>,
+    external_synced_paths_this_boot: Arc<RwLock<HashSet<String>>>,
 }
 
 // --- 数据模型 ---
@@ -110,6 +111,113 @@ fn is_image_ext(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| ALLOWED_EXTENSIONS.iter().any(|ext| ext.eq_ignore_ascii_case(e)))
         .unwrap_or(false)
+}
+
+fn escape_like_pattern(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+fn parent_folder(path: &str) -> String {
+    Path::new(path)
+        .parent()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
+}
+
+fn folder_mtime(root_dir: &Path, parent: &str) -> f64 {
+    let folder_path = if parent.is_empty() {
+        root_dir.to_path_buf()
+    } else {
+        resolve_full_path(root_dir, parent)
+    };
+
+    folder_path
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+async fn sync_external_path_to_db(pool: &Pool<Sqlite>, root_dir: &Path, rel_path: &str) -> Result<()> {
+    let normalized = normalize_rel_path(rel_path);
+    if normalized.is_empty() {
+        return Ok(());
+    }
+
+    let full_path = resolve_full_path(root_dir, &normalized);
+    let root_clone = root_dir.to_path_buf();
+
+    let scanned: Vec<ImageMetadata> = tokio::task::spawn_blocking(move || {
+        let mut results = Vec::new();
+
+        if !full_path.exists() {
+            return results;
+        }
+
+        if full_path.is_file() {
+            if let Some(meta) = process_image_metadata_sync(&full_path, &root_clone) {
+                results.push(meta);
+            }
+            return results;
+        }
+
+        for entry in WalkDir::new(&full_path).into_iter().filter_map(|e| e.ok()) {
+            if entry.file_type().is_file() && is_image_ext(entry.path()) {
+                if let Some(meta) = process_image_metadata_sync(entry.path(), &root_clone) {
+                    results.push(meta);
+                }
+            }
+        }
+
+        results
+    })
+    .await
+    .unwrap_or_default();
+
+    let scanned_paths: HashSet<String> = scanned.iter().map(|x| x.path.clone()).collect();
+    let like_prefix = format!("{}/%", escape_like_pattern(&normalized));
+
+    let mut tx = pool.begin().await?;
+
+    for meta in scanned {
+        sqlx::query("INSERT OR REPLACE INTO images (path, mtime, width, height, is_landscape) VALUES (?, ?, ?, ?, ?)")
+            .bind(meta.path)
+            .bind(meta.mtime)
+            .bind(meta.width)
+            .bind(meta.height)
+            .bind(meta.is_landscape)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    let existing_rows: Vec<(String,)> = sqlx::query_as("SELECT path FROM images WHERE path LIKE ? ESCAPE '\\\\'")
+        .bind(like_prefix)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap_or_default();
+
+    let mut deleted_count = 0;
+    for (path,) in existing_rows {
+        if !scanned_paths.contains(&path) {
+            sqlx::query("DELETE FROM images WHERE path = ?")
+                .bind(path)
+                .execute(&mut *tx)
+                .await?;
+            deleted_count += 1;
+        }
+    }
+
+    tx.commit().await?;
+    println!(
+        "🔄 [On-demand External Sync] {} | scanned {} | deleted {}",
+        normalized,
+        scanned_paths.len(),
+        deleted_count
+    );
+
+    Ok(())
 }
 
 // --- 核心逻辑：扫描与数据库 ---
@@ -293,7 +401,35 @@ async fn get_playlist(
             valid_req_paths.push(rel);
         }
     }
-    valid_req_paths.dedup();
+    let mut seen_req = HashSet::new();
+    valid_req_paths.retain(|p| seen_req.insert(p.clone()));
+
+    let mut external_paths = Vec::new();
+    let mut external_seen = HashSet::new();
+    for p in &valid_req_paths {
+        if p.is_empty() || p == "." {
+            continue;
+        }
+        let full = resolve_full_path(root_dir, p);
+        if !is_under_root(root_dir, &full) && external_seen.insert(p.clone()) {
+            external_paths.push(p.clone());
+        }
+    }
+
+    for ext_path in external_paths {
+        let already_synced = {
+            let guard = state.external_synced_paths_this_boot.read().await;
+            guard.contains(&ext_path)
+        };
+
+        if !already_synced {
+            if let Err(err) = sync_external_path_to_db(&state.db, root_dir, &ext_path).await {
+                eprintln!("⚠️ External path sync failed for {}: {}", ext_path, err);
+            }
+            let mut guard = state.external_synced_paths_this_boot.write().await;
+            guard.insert(ext_path);
+        }
+    }
 
     // 2. 数据库查询 (直接利用 SQL 筛选，速度极快)
     // 注意：构建动态 LIKE 查询比较繁琐，这里简化为获取所有符合条件的然后内存过滤
@@ -305,16 +441,17 @@ async fn get_playlist(
         // 为简化代码，这里假设后台扫描已覆盖大部分。
         // 生产环境应在此处检测 DB miss 并回填。
 
-        let prefix_pattern = if path_prefix == "." || path_prefix.is_empty() {
-             "%".to_string() // 匹配所有
+        let (mut query_builder, maybe_prefix_pattern): (String, Option<String>) = if path_prefix == "." || path_prefix.is_empty() {
+            ("SELECT * FROM images WHERE path NOT LIKE '../%'".to_string(), None)
         } else {
-             format!("{}/%", path_prefix)
+            (
+                "SELECT * FROM images WHERE path LIKE ?".to_string(),
+                Some(format!("{}/%", path_prefix)),
+            )
         };
 
-        let mut query_builder = String::from("SELECT * FROM images WHERE path LIKE ?");
-        
-        if !allow_parent {
-             query_builder.push_str(" AND path NOT LIKE '../%'");
+        if !allow_parent && path_prefix != "." && !path_prefix.is_empty() {
+            query_builder.push_str(" AND path NOT LIKE '../%'");
         }
         
         if req.orientation == "Landscape" {
@@ -323,11 +460,18 @@ async fn get_playlist(
             query_builder.push_str(" AND is_landscape = 0");
         }
 
-        let rows = sqlx::query_as::<_, ImageMetadata>(&query_builder)
-            .bind(prefix_pattern)
-            .fetch_all(&state.db)
-            .await
-            .unwrap_or_default();
+        let rows = if let Some(prefix_pattern) = maybe_prefix_pattern {
+            sqlx::query_as::<_, ImageMetadata>(&query_builder)
+                .bind(prefix_pattern)
+                .fetch_all(&state.db)
+                .await
+                .unwrap_or_default()
+        } else {
+            sqlx::query_as::<_, ImageMetadata>(&query_builder)
+                .fetch_all(&state.db)
+                .await
+                .unwrap_or_default()
+        };
         
         all_images.extend(rows);
     }
@@ -341,7 +485,46 @@ async fn get_playlist(
         "shuffle" => all_images.shuffle(&mut rand::thread_rng()),
         "date" => all_images.sort_by(|a, b| b.mtime.partial_cmp(&a.mtime).unwrap()),
         "name" => all_images.sort_by(|a, b| natord::compare_ignore_case(&a.path, &b.path)),
-        // 简化：省略复杂的 subfolder 排序逻辑，保留最常用的
+        "subfolder_random" => {
+            let mut grouped: HashMap<String, Vec<ImageMetadata>> = HashMap::new();
+            for item in all_images {
+                grouped.entry(parent_folder(&item.path)).or_default().push(item);
+            }
+
+            let mut subfolders: Vec<String> = grouped.keys().cloned().collect();
+            subfolders.shuffle(&mut rand::thread_rng());
+
+            let mut flattened = Vec::new();
+            for folder in subfolders {
+                if let Some(mut items) = grouped.remove(&folder) {
+                    items.sort_by(|a, b| natord::compare_ignore_case(&a.path, &b.path));
+                    flattened.extend(items);
+                }
+            }
+            all_images = flattened;
+        }
+        "subfolder_date" => {
+            let mut grouped: HashMap<String, Vec<ImageMetadata>> = HashMap::new();
+            for item in all_images {
+                grouped.entry(parent_folder(&item.path)).or_default().push(item);
+            }
+
+            let mut subfolders: Vec<String> = grouped.keys().cloned().collect();
+            subfolders.sort_by(|a, b| {
+                let ma = folder_mtime(root_dir, a);
+                let mb = folder_mtime(root_dir, b);
+                ma.partial_cmp(&mb).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let mut flattened = Vec::new();
+            for folder in subfolders {
+                if let Some(mut items) = grouped.remove(&folder) {
+                    items.sort_by(|a, b| natord::compare_ignore_case(&a.path, &b.path));
+                    flattened.extend(items);
+                }
+            }
+            all_images = flattened;
+        }
         _ => all_images.sort_by(|a, b| natord::compare_ignore_case(&a.path, &b.path)),
     }
 
@@ -533,6 +716,7 @@ async fn main() -> Result<()> {
         db: pool.clone(),
         root_dir: Arc::new(root_dir.clone()),
         allow_parent_dir_access: Arc::new(RwLock::new(env::var("GALLERY_ALLOW_PARENT_DIR_ACCESS").unwrap_or_default() == "1")),
+        external_synced_paths_this_boot: Arc::new(RwLock::new(HashSet::new())),
     };
 
     // 启动时触发一次扫描
