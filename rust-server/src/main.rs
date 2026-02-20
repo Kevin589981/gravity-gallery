@@ -164,6 +164,33 @@ fn parent_folder(path: &str) -> String {
         .unwrap_or_default()
 }
 
+fn file_stem_from_rel_path(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+fn strip_trailing_index_suffix(name: &str) -> String {
+    if let Some((prefix, suffix)) = name.rsplit_once(" (") {
+        if suffix.ends_with(')') {
+            let digits = &suffix[..suffix.len() - 1];
+            if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+                return prefix.trim_end().to_string();
+            }
+        }
+    }
+    name.to_string()
+}
+
+fn folder_first_image_prefix(items: &[ImageMetadata]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let stem = file_stem_from_rel_path(&items[0].path);
+    strip_trailing_index_suffix(&stem)
+}
+
 fn folder_mtime(root_dir: &Path, parent: &str) -> f64 {
     let folder_path = if parent.is_empty() {
         root_dir.to_path_buf()
@@ -635,6 +662,32 @@ async fn get_playlist(
             for folder in subfolders {
                 if let Some(mut items) = grouped.remove(&folder) {
                     items.sort_by(|a, b| natord::compare_ignore_case(&a.path, &b.path));
+                    flattened.extend(items);
+                }
+            }
+            all_images = flattened;
+        }
+        "subfolder_prefix" => {
+            let mut grouped: HashMap<String, Vec<ImageMetadata>> = HashMap::new();
+            for item in all_images {
+                grouped.entry(parent_folder(&item.path)).or_default().push(item);
+            }
+
+            let mut folder_orders: Vec<(String, String)> = Vec::new();
+            for (folder, items) in &mut grouped {
+                items.sort_by(|a, b| natord::compare_ignore_case(&a.path, &b.path));
+                let prefix = folder_first_image_prefix(items);
+                folder_orders.push((folder.clone(), prefix));
+            }
+
+            folder_orders.sort_by(|(folder_a, prefix_a), (folder_b, prefix_b)| {
+                natord::compare_ignore_case(prefix_a, prefix_b)
+                    .then_with(|| natord::compare_ignore_case(folder_a, folder_b))
+            });
+
+            let mut flattened = Vec::new();
+            for (folder, _) in folder_orders {
+                if let Some(items) = grouped.remove(&folder) {
                     flattened.extend(items);
                 }
             }

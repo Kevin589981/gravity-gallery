@@ -357,6 +357,7 @@ const App: React.FC = () => {
             else if (sort === SortMode.Date) sortStr = 'date';
             else if (sort === SortMode.SubfolderRandom) sortStr = 'subfolder_random';
             else if (sort === SortMode.SubfolderDate) sortStr = 'subfolder_date';
+            else if (sort === SortMode.SubfolderPrefix) sortStr = 'subfolder_prefix';
             
             const body: any = {
                 paths,

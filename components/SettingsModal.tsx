@@ -270,7 +270,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
                             </div>
                         </div>
 
-                        {/* Sort Mode Section - Enhanced with all 5 modes */}
+                        {/* Sort Mode Section */}
                         <div className="bg-neutral-800/50 p-4 rounded-xl space-y-3">
                             <div className="flex items-center justify-between">
                                 <span className="text-neutral-200 text-sm font-medium">Sort Order</span>
@@ -314,12 +314,21 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
                                 </button>
 
                                 <button
-                                    className={`px-3 py-2 text-xs rounded-lg transition-all col-span-2 ${config.sortMode === SortMode.SubfolderDate ? 'bg-purple-600 text-white' : 'bg-neutral-700 text-neutral-400 hover:bg-neutral-600'}`}
+                                    className={`px-3 py-2 text-xs rounded-lg transition-all ${config.sortMode === SortMode.SubfolderDate ? 'bg-purple-600 text-white' : 'bg-neutral-700 text-neutral-400 hover:bg-neutral-600'}`}
                                     onClick={() => updateConfig('sortMode', SortMode.SubfolderDate)}
                                     title="Subfolders sorted by date, files sorted naturally within each"
                                 >
                                     <div className="text-sm font-bold mb-1">📁📅</div>
                                     <div>Folder by Date</div>
+                                </button>
+
+                                <button
+                                    className={`px-3 py-2 text-xs rounded-lg transition-all ${config.sortMode === SortMode.SubfolderPrefix ? 'bg-purple-600 text-white' : 'bg-neutral-700 text-neutral-400 hover:bg-neutral-600'}`}
+                                    onClick={() => updateConfig('sortMode', SortMode.SubfolderPrefix)}
+                                    title="Subfolders sorted by first image name prefix, files sorted naturally within each"
+                                >
+                                    <div className="text-sm font-bold mb-1">📁🔤</div>
+                                    <div>Folder by Prefix</div>
                                 </button>
                             </div>
                         </div>

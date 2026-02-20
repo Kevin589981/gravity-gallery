@@ -9,6 +9,7 @@ export enum SortMode {
     Date = 'Date', // Newest first
     SubfolderRandom = 'SubfolderRandom', // Subfolder Random > File Name
     SubfolderDate = 'SubfolderDate', // Subfolder Date > File Name
+    SubfolderPrefix = 'SubfolderPrefix', // Subfolder First-Image Prefix > File Name
 }
 
 export enum SortDirection {

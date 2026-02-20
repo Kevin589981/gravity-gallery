@@ -4,6 +4,7 @@ import mimetypes
 import sqlite3
 import time
 import json
+import re
 from pathlib import Path
 from typing import List, Optional
 from contextlib import contextmanager, asynccontextmanager
@@ -299,6 +300,13 @@ def is_db_path_under_root(db_path: str) -> bool:
 
 def normalize_rel_path(path: str) -> str:
     return (path or "").replace('\\', '/').strip('/').replace('/./', '/')
+
+def folder_name_prefix_from_first_item(items: List[dict]) -> str:
+    if not items:
+        return ""
+    first_path = items[0]['path']
+    stem = os.path.splitext(os.path.basename(first_path))[0]
+    return re.sub(r'\s*\(\d+\)$', '', stem).strip()
 
 def sanitize_playlist_paths(paths: List[str]) -> List[str]:
     """
@@ -678,6 +686,26 @@ async def get_playlist(req: PlaylistRequest, request: Request, background_tasks:
             items = subfolder_map[folder]
             items.sort(key=lambda x: natsort_key(x['path']))
             final_paths.extend([item['path'] for item in items])
+    elif req.sort == 'subfolder_prefix':
+        subfolder_map = {}
+        for item in results:
+            path = item['path']
+            parent = os.path.dirname(path)
+            if parent not in subfolder_map:
+                subfolder_map[parent] = []
+            subfolder_map[parent].append(item)
+
+        for folder in subfolder_map:
+            subfolder_map[folder].sort(key=lambda x: natsort_key(x['path']))
+
+        subfolders = sorted(
+            subfolder_map.keys(),
+            key=lambda folder: natsort_key(folder_name_prefix_from_first_item(subfolder_map[folder]))
+        )
+
+        final_paths = []
+        for folder in subfolders:
+            final_paths.extend([item['path'] for item in subfolder_map[folder]])
     else:
         results.sort(key=lambda x: natsort_key(x['path']))
         final_paths = [r['path'] for r in results]
