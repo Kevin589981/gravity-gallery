@@ -778,6 +778,7 @@ async def restore_playlist(req: RestorePlaylistRequest, request: Request, backgr
         "status": "restored",
         "valid_count": len(valid_paths),
         "original_count": len(playlist),
+        "current_index": current_index,
         "playlist": valid_paths  # 返回验证后的有效列表
     }
 
@@ -811,6 +812,36 @@ async def get_session_status(request: Request):
         "has_session": False,
         "source": None,
         "playlist_size": 0
+    }
+
+@app.get("/api/session-playlist")
+async def get_session_playlist(request: Request):
+    """返回当前客户端会话的完整 playlist，优先内存，其次数据库。"""
+    client_ip = request.client.host
+
+    session = user_sessions.get(client_ip)
+    if session:
+        return {
+            "has_session": True,
+            "source": "memory",
+            "playlist_size": len(session.playlist),
+            "playlist": session.playlist,
+        }
+
+    playlist = load_playlist_from_db(client_ip)
+    if playlist:
+        return {
+            "has_session": True,
+            "source": "database",
+            "playlist_size": len(playlist),
+            "playlist": playlist,
+        }
+
+    return {
+        "has_session": False,
+        "source": None,
+        "playlist_size": 0,
+        "playlist": [],
     }
 
 @app.get("/api/browse")

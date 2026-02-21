@@ -9,11 +9,33 @@ import SettingsModal from './components/SettingsModal';
 import { Icons } from './components/Icon';
 
 const STORAGE_KEY = 'gravity_gallery_state_v1';
+const SERVER_PLAYLIST_SNAPSHOT_KEY = 'gravity_gallery_server_playlist_snapshot_v1';
 const MIN_PRELOAD_COUNT = 1;
 const MAX_PRELOAD_COUNT = 20;
 const MIN_CACHE_RESERVE_COUNT = 0;
 const MAX_CACHE_RESERVE_COUNT = 100;
 const PRELOAD_CONCURRENCY = 2;
+
+interface ServerPlaylistSnapshot {
+    serverUrl: string;
+    selectedServerPaths: string[];
+    playlist: string[];
+    currentIndex: number;
+    updatedAt: number;
+}
+
+interface SessionStatusResponse {
+    has_session: boolean;
+    source: 'memory' | 'database' | null;
+    playlist_size: number;
+}
+
+interface SessionPlaylistResponse {
+    has_session: boolean;
+    source: 'memory' | 'database' | null;
+    playlist_size: number;
+    playlist: string[];
+}
 
 const App: React.FC = () => {
     const [allImages, setAllImages] = useState<ImageFile[]>([]);
@@ -70,6 +92,153 @@ const App: React.FC = () => {
         preloadedBlobCache.current.clear();
     }, []);
 
+    const readServerPlaylistSnapshot = useCallback((): ServerPlaylistSnapshot | null => {
+        const raw = localStorage.getItem(SERVER_PLAYLIST_SNAPSHOT_KEY);
+        if (!raw) return null;
+
+        try {
+            const parsed = JSON.parse(raw);
+            if (!parsed || typeof parsed !== 'object') return null;
+            if (!Array.isArray(parsed.playlist) || !Array.isArray(parsed.selectedServerPaths)) return null;
+            if (typeof parsed.serverUrl !== 'string') return null;
+            const currentIndex = Number.isFinite(parsed.currentIndex) ? Math.floor(parsed.currentIndex) : 0;
+
+            return {
+                serverUrl: parsed.serverUrl,
+                selectedServerPaths: parsed.selectedServerPaths,
+                playlist: parsed.playlist,
+                currentIndex,
+                updatedAt: Number.isFinite(parsed.updatedAt) ? parsed.updatedAt : Date.now(),
+            };
+        } catch {
+            return null;
+        }
+    }, []);
+
+    const writeServerPlaylistSnapshot = useCallback((snapshot: ServerPlaylistSnapshot) => {
+        localStorage.setItem(SERVER_PLAYLIST_SNAPSHOT_KEY, JSON.stringify(snapshot));
+    }, []);
+
+    const clearServerPlaylistSnapshot = useCallback(() => {
+        localStorage.removeItem(SERVER_PLAYLIST_SNAPSHOT_KEY);
+    }, []);
+
+    const resetUITimer = useCallback(() => {
+        if (showSettings) return;
+        setIsUIOpen(true);
+        if (uiTimeoutRef.current) clearTimeout(uiTimeoutRef.current);
+        uiTimeoutRef.current = setTimeout(() => {
+            if (!showSettings) setIsUIOpen(false);
+        }, 3000);
+    }, [showSettings]);
+
+    const applyServerPlaylist = useCallback((baseUrl: string, relPaths: string[], desiredIndex: number) => {
+        const imageObjects = relPaths.map(relPath => ({
+            id: relPath,
+            url: `${baseUrl}/api/file?path=${encodeURIComponent(relPath)}`,
+            name: relPath.split('/').pop() || 'Image',
+            isLandscape: false
+        }));
+
+        playlistVersionRef.current += 1;
+        setAllImages(prev => {
+            releaseServerBlobUrls(prev);
+            return imageObjects;
+        });
+
+        const maxIndex = Math.max(0, imageObjects.length - 1);
+        const safeIndex = Math.max(0, Math.min(desiredIndex, maxIndex));
+        setCurrentIndex(safeIndex);
+        setNoMatchesFound(false);
+        setIsUIOpen(true);
+        resetUITimer();
+    }, [releaseServerBlobUrls, resetUITimer]);
+
+    const tryResumeServerPlaylist = useCallback(async (
+        url: string,
+        selectedPaths: string[]
+    ): Promise<boolean> => {
+        const normalizedUrl = url.endsWith('/') ? url.slice(0, -1) : url;
+        const snapshot = readServerPlaylistSnapshot();
+
+        const snapshotMatchesCurrentSelection = !!snapshot
+            && normalizedUrl === (snapshot.serverUrl.endsWith('/') ? snapshot.serverUrl.slice(0, -1) : snapshot.serverUrl)
+            && JSON.stringify(snapshot.selectedServerPaths) === JSON.stringify(selectedPaths);
+
+        try {
+            const statusRes = await fetch(`${normalizedUrl}/api/session-status`);
+            if (!statusRes.ok) return false;
+
+            const statusData: SessionStatusResponse = await statusRes.json();
+
+            if (statusData?.has_session) {
+                const playlistRes = await fetch(`${normalizedUrl}/api/session-playlist`);
+                if (!playlistRes.ok) return false;
+
+                const playlistData: SessionPlaylistResponse = await playlistRes.json();
+                const sessionPaths = Array.isArray(playlistData?.playlist) ? playlistData.playlist : [];
+                if (sessionPaths.length === 0) return false;
+
+                const desiredIndex = snapshotMatchesCurrentSelection
+                    ? snapshot!.currentIndex
+                    : 0;
+
+                preloadScheduleTokenRef.current += 1;
+                preloadInProgress.current.clear();
+                clearPreloadedBlobCache();
+
+                applyServerPlaylist(normalizedUrl, sessionPaths, desiredIndex);
+                writeServerPlaylistSnapshot({
+                    serverUrl: normalizedUrl,
+                    selectedServerPaths: selectedPaths,
+                    playlist: sessionPaths,
+                    currentIndex: Math.max(0, Math.min(desiredIndex, sessionPaths.length - 1)),
+                    updatedAt: Date.now(),
+                });
+                return true;
+            }
+
+            if (!snapshotMatchesCurrentSelection) return false;
+            if (!Array.isArray(snapshot!.playlist) || snapshot!.playlist.length === 0) return false;
+
+            const restoreRes = await fetch(`${normalizedUrl}/api/restore-playlist`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    playlist: snapshot!.playlist,
+                    current_index: snapshot!.currentIndex,
+                })
+            });
+
+            if (!restoreRes.ok) return false;
+
+            const restoreData: any = await restoreRes.json();
+            const restoredPaths = Array.isArray(restoreData?.playlist) ? restoreData.playlist : [];
+            if (restoredPaths.length === 0) return false;
+
+            const restoredIndex = Number.isFinite(restoreData?.current_index)
+                ? restoreData.current_index
+                : snapshot!.currentIndex;
+
+            preloadScheduleTokenRef.current += 1;
+            preloadInProgress.current.clear();
+            clearPreloadedBlobCache();
+
+            applyServerPlaylist(normalizedUrl, restoredPaths, restoredIndex);
+
+            writeServerPlaylistSnapshot({
+                serverUrl: normalizedUrl,
+                selectedServerPaths: selectedPaths,
+                playlist: restoredPaths,
+                currentIndex: Math.max(0, Math.min(restoredIndex, restoredPaths.length - 1)),
+                updatedAt: Date.now(),
+            });
+            return true;
+        } catch {
+            return false;
+        }
+    }, [applyServerPlaylist, clearPreloadedBlobCache, readServerPlaylistSnapshot, writeServerPlaylistSnapshot]);
+
     useEffect(() => {
         allImagesRef.current = allImages;
     }, [allImages]);
@@ -90,16 +259,6 @@ const App: React.FC = () => {
                 const parsed = JSON.parse(saved);
                 const mergedConfig: AppConfig = parsed.config ? { ...DEFAULT_CONFIG, ...parsed.config } : DEFAULT_CONFIG;
                 setConfig(mergedConfig);
-                if (mergedConfig.serverUrl && mergedConfig.selectedServerPaths) {
-                    fetchServerPlaylist(
-                        mergedConfig.serverUrl,
-                        mergedConfig.selectedServerPaths,
-                        mergedConfig.sortMode,
-                        mergedConfig.sortDirection,
-                        mergedConfig.orientationFilter,
-                        null
-                    );
-                }
             } catch (e) { console.error("Failed to load saved state", e); }
         }
     }, []);
@@ -133,7 +292,12 @@ const App: React.FC = () => {
                     const req = pendingServerFetchRef.current;
                     pendingServerFetchRef.current = null;
                     if (req) {
-                        fetchServerPlaylist(req.url, req.paths, req.sort, req.direction, req.orientation, req.currentPath);
+                        (async () => {
+                            const restored = await tryResumeServerPlaylist(req.url, req.paths);
+                            if (!restored) {
+                                fetchServerPlaylist(req.url, req.paths, req.sort, req.direction, req.orientation, req.currentPath);
+                            }
+                        })();
                     }
                 }
             } else if (!config.serverUrl) {
@@ -156,7 +320,7 @@ const App: React.FC = () => {
         return () => {
             if (fetchDebounceRef.current) clearTimeout(fetchDebounceRef.current);
         };
-    }, [config.serverUrl, config.selectedServerPaths, config.sortMode, config.sortDirection, config.orientationFilter]);
+    }, [config.serverUrl, config.selectedServerPaths, config.sortMode, config.sortDirection, config.orientationFilter, tryResumeServerPlaylist]);
 
     // If a server playlist fetch was skipped due to loading, run it once loading ends.
     useEffect(() => {
@@ -164,8 +328,26 @@ const App: React.FC = () => {
         const req = pendingServerFetchRef.current;
         if (!req) return;
         pendingServerFetchRef.current = null;
-        fetchServerPlaylist(req.url, req.paths, req.sort, req.direction, req.orientation, req.currentPath);
-    }, [isLoading]);
+        (async () => {
+            const restored = await tryResumeServerPlaylist(req.url, req.paths);
+            if (!restored) {
+                fetchServerPlaylist(req.url, req.paths, req.sort, req.direction, req.orientation, req.currentPath);
+            }
+        })();
+    }, [isLoading, tryResumeServerPlaylist]);
+
+    useEffect(() => {
+        if (!config.serverUrl || !config.selectedServerPaths) return;
+        if (allImages.length === 0) return;
+
+        writeServerPlaylistSnapshot({
+            serverUrl: config.serverUrl,
+            selectedServerPaths: config.selectedServerPaths,
+            playlist: allImages.map(img => img.id),
+            currentIndex,
+            updatedAt: Date.now(),
+        });
+    }, [config.serverUrl, config.selectedServerPaths, allImages, currentIndex, writeServerPlaylistSnapshot]);
 
     // --- Preload Logic ---
     useEffect(() => {
@@ -437,6 +619,7 @@ const App: React.FC = () => {
             return sorted;
         });
         setConfig(prev => ({ ...prev, serverUrl: undefined, selectedServerPaths: undefined }));
+        clearServerPlaylistSnapshot();
         setCurrentIndex(0);
         setNoMatchesFound(false);
         setIsLoading(false);
@@ -462,6 +645,7 @@ const App: React.FC = () => {
             return shuffleArray(processed);
         });
         setConfig(prev => ({ ...prev, serverUrl: undefined, selectedServerPaths: undefined }));
+        clearServerPlaylistSnapshot();
         setCurrentIndex(0);
         setNoMatchesFound(false);
         setIsLoading(false);
@@ -488,15 +672,6 @@ const App: React.FC = () => {
         intervalRef.current = setInterval(nextImage, config.refreshInterval * 1000);
         return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
     }, [isPaused, allImages.length, config.refreshInterval, nextImage, showSettings, noMatchesFound]);
-
-    const resetUITimer = useCallback(() => {
-        if (showSettings) return;
-        setIsUIOpen(true);
-        if (uiTimeoutRef.current) clearTimeout(uiTimeoutRef.current);
-        uiTimeoutRef.current = setTimeout(() => {
-            if (!showSettings) setIsUIOpen(false);
-        }, 3000);
-    }, [showSettings]);
 
     const hideUI = useCallback(() => {
         if (uiTimeoutRef.current) {
@@ -549,7 +724,7 @@ const App: React.FC = () => {
                 </div>
                 <button onClick={() => setShowSettings(true)} className="bg-blue-600 px-6 py-3 rounded-xl font-bold text-white hover:bg-blue-500 transition-colors">Open Settings</button>
                 <SettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} config={config} onConfigChange={setConfig} fileCount={allImages.length}
-                    onReselectFolder={() => { setAllImages(prev => { releaseServerBlobUrls(prev); return []; }); setShowSettings(false); setNoMatchesFound(false); localStorage.removeItem(STORAGE_KEY); preloadInProgress.current.clear(); clearPreloadedBlobCache(); }}
+                    onReselectFolder={() => { setAllImages(prev => { releaseServerBlobUrls(prev); return []; }); setShowSettings(false); setNoMatchesFound(false); localStorage.removeItem(STORAGE_KEY); clearServerPlaylistSnapshot(); preloadInProgress.current.clear(); clearPreloadedBlobCache(); }}
                 />
             </div>
         )
@@ -570,7 +745,7 @@ const App: React.FC = () => {
                 </button>
             )}
             <SettingsModal isOpen={showSettings} onClose={() => { setShowSettings(false); setIsPaused(false); resetUITimer(); }} config={config} onConfigChange={setConfig} fileCount={allImages.length}
-                onReselectFolder={() => { setAllImages(prev => { releaseServerBlobUrls(prev); return []; }); setShowSettings(false); setNoMatchesFound(false); localStorage.removeItem(STORAGE_KEY); preloadInProgress.current.clear(); clearPreloadedBlobCache(); }}
+                onReselectFolder={() => { setAllImages(prev => { releaseServerBlobUrls(prev); return []; }); setShowSettings(false); setNoMatchesFound(false); localStorage.removeItem(STORAGE_KEY); clearServerPlaylistSnapshot(); preloadInProgress.current.clear(); clearPreloadedBlobCache(); }}
             />
         </div>
     );

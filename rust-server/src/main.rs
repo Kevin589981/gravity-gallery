@@ -35,6 +35,7 @@ struct AppState {
     root_dir: Arc<PathBuf>,
     allow_parent_dir_access: Arc<RwLock<bool>>,
     external_synced_paths_this_boot: Arc<RwLock<HashSet<String>>>,
+    user_sessions: Arc<RwLock<HashMap<String, Vec<String>>>>,
     log_api_file_requests: bool,
 }
 
@@ -95,6 +96,14 @@ struct SessionStatusResponse {
     has_session: bool,
     source: Option<String>,
     playlist_size: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionPlaylistResponse {
+    has_session: bool,
+    source: Option<String>,
+    playlist_size: usize,
+    playlist: Vec<String>,
 }
 
 #[derive(sqlx::FromRow, Clone, Debug)]
@@ -723,6 +732,11 @@ async fn get_playlist(
             .ok();
     }
 
+    {
+        let mut sessions = state.user_sessions.write().await;
+        sessions.insert(ip.clone(), final_paths.clone());
+    }
+
     Json(final_paths)
 }
 
@@ -732,6 +746,7 @@ async fn restore_playlist(
     Json(req): Json<RestorePlaylistRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let original_count = req.playlist.len();
+    println!("🔄 [Restore Playlist] 请求恢复播放列表，原始路径数量: {}", original_count);
     if original_count == 0 {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -774,6 +789,11 @@ async fn restore_playlist(
             .ok();
     }
 
+    {
+        let mut sessions = state.user_sessions.write().await;
+        sessions.insert(ip.clone(), valid_paths.clone());
+    }
+
     let current_index = req.current_index.min(valid_paths.len().saturating_sub(1));
 
     Ok(Json(serde_json::json!({
@@ -790,6 +810,17 @@ async fn session_status(
     connect_info: ConnectInfo<SocketAddr>,
 ) -> Json<SessionStatusResponse> {
     let ip = connect_info.0.ip().to_string();
+
+    {
+        let sessions = state.user_sessions.read().await;
+        if let Some(playlist) = sessions.get(&ip) {
+            return Json(SessionStatusResponse {
+                has_session: true,
+                source: Some("memory".to_string()),
+                playlist_size: playlist.len(),
+            });
+        }
+    }
     
     // 从数据库查询
     let row: Option<(String,)> = sqlx::query_as("SELECT playlist FROM playlists WHERE client_ip = ?")
@@ -809,6 +840,49 @@ async fn session_status(
     }
 
     Json(SessionStatusResponse { has_session: false, source: None, playlist_size: 0 })
+}
+
+async fn session_playlist(
+    State(state): State<AppState>,
+    connect_info: ConnectInfo<SocketAddr>,
+) -> Json<SessionPlaylistResponse> {
+    let ip = connect_info.0.ip().to_string();
+
+    {
+        let sessions = state.user_sessions.read().await;
+        if let Some(playlist) = sessions.get(&ip) {
+            return Json(SessionPlaylistResponse {
+                has_session: true,
+                source: Some("memory".to_string()),
+                playlist_size: playlist.len(),
+                playlist: playlist.clone(),
+            });
+        }
+    }
+
+    let row: Option<(String,)> = sqlx::query_as("SELECT playlist FROM playlists WHERE client_ip = ?")
+        .bind(&ip)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
+
+    if let Some((playlist_json,)) = row {
+        if let Ok(list) = serde_json::from_str::<Vec<String>>(&playlist_json) {
+            return Json(SessionPlaylistResponse {
+                has_session: true,
+                source: Some("database".to_string()),
+                playlist_size: list.len(),
+                playlist: list,
+            });
+        }
+    }
+
+    Json(SessionPlaylistResponse {
+        has_session: false,
+        source: None,
+        playlist_size: 0,
+        playlist: Vec::new(),
+    })
 }
 
 // 简单的文件服务，不带缓存逻辑，依靠 OS Page Cache
@@ -1031,6 +1105,7 @@ async fn main() -> Result<()> {
         root_dir: Arc::new(root_dir.clone()),
         allow_parent_dir_access: Arc::new(RwLock::new(env::var("GALLERY_ALLOW_PARENT_DIR_ACCESS").unwrap_or_default() == "1")),
         external_synced_paths_this_boot: Arc::new(RwLock::new(HashSet::new())),
+        user_sessions: Arc::new(RwLock::new(HashMap::new())),
         log_api_file_requests: env_flag_enabled("GALLERY_LOG_API_FILE_REQUESTS"),
     };
 
@@ -1052,6 +1127,7 @@ async fn main() -> Result<()> {
         .route("/api/playlist", post(get_playlist))
         .route("/api/restore-playlist", post(restore_playlist))
         .route("/api/session-status", get(session_status))
+        .route("/api/session-playlist", get(session_playlist))
         .route("/api/runtime-config", get(get_runtime_config).post(set_runtime_config))
         .route("/api/runtime-config/toggle", post(toggle_runtime_config))
         // --- 修复点开始 ---
