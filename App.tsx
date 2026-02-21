@@ -19,6 +19,7 @@ const PRELOAD_CONCURRENCY = 2;
 interface ServerPlaylistSnapshot {
     serverUrl: string;
     selectedServerPaths: string[];
+    criteriaSignature: string;
     playlist: string[];
     currentIndex: number;
     updatedAt: number;
@@ -35,12 +36,38 @@ interface SessionPlaylistResponse {
     source: 'memory' | 'database' | null;
     playlist_size: number;
     playlist: string[];
+    criteria?: {
+        sort: string;
+        direction: string;
+        orientation: string;
+        paths: string[];
+    } | null;
 }
+
+interface PlaylistCriteriaInput {
+    serverUrl: string;
+    selectedPaths: string[];
+    sort: SortMode;
+    direction: SortDirection;
+    orientation: OrientationFilter;
+}
+
+const loadPersistedConfig = (): AppConfig => {
+    try {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (!saved) return DEFAULT_CONFIG;
+        const parsed = JSON.parse(saved);
+        const mergedConfig: AppConfig = parsed?.config ? { ...DEFAULT_CONFIG, ...parsed.config } : DEFAULT_CONFIG;
+        return mergedConfig;
+    } catch {
+        return DEFAULT_CONFIG;
+    }
+};
 
 const App: React.FC = () => {
     const [allImages, setAllImages] = useState<ImageFile[]>([]);
     const [currentIndex, setCurrentIndex] = useState(0);
-    const [config, setConfig] = useState<AppConfig>(DEFAULT_CONFIG);
+    const [config, setConfig] = useState<AppConfig>(() => loadPersistedConfig());
     const [isPaused, setIsPaused] = useState(false);
     const [isUIOpen, setIsUIOpen] = useState(false);
     const [showSettings, setShowSettings] = useState(false);
@@ -62,7 +89,11 @@ const App: React.FC = () => {
         direction: SortDirection;
         orientation: OrientationFilter;
         currentPath: string | null;
+        reason: 'auto' | 'user';
     } | null>(null);
+
+    // 标记“用户手动修改筛选条件（影响播放列表的 criteria）”，用于跳过自动恢复逻辑。
+    const userCriteriaChangeRef = useRef(false);
     
     // 用于防止在设置更改时 useEffect 多次触发 fetch
     const fetchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -101,11 +132,13 @@ const App: React.FC = () => {
             if (!parsed || typeof parsed !== 'object') return null;
             if (!Array.isArray(parsed.playlist) || !Array.isArray(parsed.selectedServerPaths)) return null;
             if (typeof parsed.serverUrl !== 'string') return null;
+            if (typeof parsed.criteriaSignature !== 'string') return null;
             const currentIndex = Number.isFinite(parsed.currentIndex) ? Math.floor(parsed.currentIndex) : 0;
 
             return {
                 serverUrl: parsed.serverUrl,
                 selectedServerPaths: parsed.selectedServerPaths,
+                criteriaSignature: parsed.criteriaSignature,
                 playlist: parsed.playlist,
                 currentIndex,
                 updatedAt: Number.isFinite(parsed.updatedAt) ? parsed.updatedAt : Date.now(),
@@ -121,6 +154,17 @@ const App: React.FC = () => {
 
     const clearServerPlaylistSnapshot = useCallback(() => {
         localStorage.removeItem(SERVER_PLAYLIST_SNAPSHOT_KEY);
+    }, []);
+
+    const buildCriteriaSignature = useCallback((criteria: PlaylistCriteriaInput): string => {
+        const normalizedUrl = criteria.serverUrl.endsWith('/') ? criteria.serverUrl.slice(0, -1) : criteria.serverUrl;
+        return JSON.stringify({
+            serverUrl: normalizedUrl,
+            selectedPaths: criteria.selectedPaths,
+            sort: criteria.sort,
+            direction: criteria.direction,
+            orientation: criteria.orientation,
+        });
     }, []);
 
     const resetUITimer = useCallback(() => {
@@ -156,14 +200,29 @@ const App: React.FC = () => {
 
     const tryResumeServerPlaylist = useCallback(async (
         url: string,
-        selectedPaths: string[]
+        selectedPaths: string[],
+        sort: SortMode,
+        direction: SortDirection,
+        orientation: OrientationFilter
     ): Promise<boolean> => {
         const normalizedUrl = url.endsWith('/') ? url.slice(0, -1) : url;
         const snapshot = readServerPlaylistSnapshot();
+        const currentCriteriaSignature = buildCriteriaSignature({
+            serverUrl: normalizedUrl,
+            selectedPaths,
+            sort,
+            direction,
+            orientation,
+        });
 
         const snapshotMatchesCurrentSelection = !!snapshot
             && normalizedUrl === (snapshot.serverUrl.endsWith('/') ? snapshot.serverUrl.slice(0, -1) : snapshot.serverUrl)
-            && JSON.stringify(snapshot.selectedServerPaths) === JSON.stringify(selectedPaths);
+            && JSON.stringify(snapshot.selectedServerPaths) === JSON.stringify(selectedPaths)
+            && snapshot.criteriaSignature === currentCriteriaSignature;
+
+        if (snapshot && !snapshotMatchesCurrentSelection) {
+            return false;
+        }
 
         try {
             const statusRes = await fetch(`${normalizedUrl}/api/session-status`);
@@ -191,6 +250,7 @@ const App: React.FC = () => {
                 writeServerPlaylistSnapshot({
                     serverUrl: normalizedUrl,
                     selectedServerPaths: selectedPaths,
+                    criteriaSignature: currentCriteriaSignature,
                     playlist: sessionPaths,
                     currentIndex: Math.max(0, Math.min(desiredIndex, sessionPaths.length - 1)),
                     updatedAt: Date.now(),
@@ -207,6 +267,12 @@ const App: React.FC = () => {
                 body: JSON.stringify({
                     playlist: snapshot!.playlist,
                     current_index: snapshot!.currentIndex,
+                    criteria: {
+                        sort,
+                        direction,
+                        orientation,
+                        paths: selectedPaths,
+                    }
                 })
             });
 
@@ -229,6 +295,7 @@ const App: React.FC = () => {
             writeServerPlaylistSnapshot({
                 serverUrl: normalizedUrl,
                 selectedServerPaths: selectedPaths,
+                criteriaSignature: currentCriteriaSignature,
                 playlist: restoredPaths,
                 currentIndex: Math.max(0, Math.min(restoredIndex, restoredPaths.length - 1)),
                 updatedAt: Date.now(),
@@ -237,7 +304,7 @@ const App: React.FC = () => {
         } catch {
             return false;
         }
-    }, [applyServerPlaylist, clearPreloadedBlobCache, readServerPlaylistSnapshot, writeServerPlaylistSnapshot]);
+    }, [applyServerPlaylist, buildCriteriaSignature, clearPreloadedBlobCache, readServerPlaylistSnapshot, writeServerPlaylistSnapshot]);
 
     useEffect(() => {
         allImagesRef.current = allImages;
@@ -251,24 +318,30 @@ const App: React.FC = () => {
         };
     }, [clearPreloadedBlobCache, releaseServerBlobUrls]);
 
-    // Persistence: Load on mount
-    useEffect(() => {
-        const saved = localStorage.getItem(STORAGE_KEY);
-        if (saved) {
-            try {
-                const parsed = JSON.parse(saved);
-                const mergedConfig: AppConfig = parsed.config ? { ...DEFAULT_CONFIG, ...parsed.config } : DEFAULT_CONFIG;
-                setConfig(mergedConfig);
-            } catch (e) { console.error("Failed to load saved state", e); }
-        }
-    }, []);
-
     // Persistence: Save on change
     useEffect(() => {
-        if (config.serverUrl) {
+        try {
             localStorage.setItem(STORAGE_KEY, JSON.stringify({ config }));
+        } catch {
+            // ignore quota / private mode errors
         }
     }, [config]);
+
+    const handleConfigChange = useCallback((newConfig: AppConfig) => {
+        setConfig((prev) => {
+            const criteriaChanged =
+                prev.serverUrl !== newConfig.serverUrl ||
+                JSON.stringify(prev.selectedServerPaths ?? []) !== JSON.stringify(newConfig.selectedServerPaths ?? []) ||
+                prev.sortMode !== newConfig.sortMode ||
+                prev.sortDirection !== newConfig.sortDirection ||
+                prev.orientationFilter !== newConfig.orientationFilter;
+
+            if (criteriaChanged) {
+                userCriteriaChangeRef.current = true;
+            }
+            return newConfig;
+        });
+    }, []);
 
     // --- SERVER FETCH LOGIC (triggered by config changes) ---
     useEffect(() => {
@@ -278,6 +351,10 @@ const App: React.FC = () => {
         fetchDebounceRef.current = setTimeout(() => {
             if (config.serverUrl && config.selectedServerPaths) {
                 const currentImagePath = allImages.length > 0 ? allImages[currentIndex]?.id : null;
+
+                const reason: 'auto' | 'user' = userCriteriaChangeRef.current ? 'user' : 'auto';
+                userCriteriaChangeRef.current = false;
+
                 // If a fetch is already in-flight, queue the latest desired fetch instead of skipping.
                 pendingServerFetchRef.current = {
                     url: config.serverUrl,
@@ -286,6 +363,7 @@ const App: React.FC = () => {
                     direction: config.sortDirection,
                     orientation: config.orientationFilter,
                     currentPath: currentImagePath,
+                    reason,
                 };
 
                 if (!isLoading) {
@@ -293,8 +371,12 @@ const App: React.FC = () => {
                     pendingServerFetchRef.current = null;
                     if (req) {
                         (async () => {
-                            const restored = await tryResumeServerPlaylist(req.url, req.paths);
-                            if (!restored) {
+                            if (req.reason === 'auto') {
+                                const restored = await tryResumeServerPlaylist(req.url, req.paths, req.sort, req.direction, req.orientation);
+                                if (!restored) {
+                                    fetchServerPlaylist(req.url, req.paths, req.sort, req.direction, req.orientation, req.currentPath);
+                                }
+                            } else {
                                 fetchServerPlaylist(req.url, req.paths, req.sort, req.direction, req.orientation, req.currentPath);
                             }
                         })();
@@ -329,8 +411,12 @@ const App: React.FC = () => {
         if (!req) return;
         pendingServerFetchRef.current = null;
         (async () => {
-            const restored = await tryResumeServerPlaylist(req.url, req.paths);
-            if (!restored) {
+            if (req.reason === 'auto') {
+                const restored = await tryResumeServerPlaylist(req.url, req.paths, req.sort, req.direction, req.orientation);
+                if (!restored) {
+                    fetchServerPlaylist(req.url, req.paths, req.sort, req.direction, req.orientation, req.currentPath);
+                }
+            } else {
                 fetchServerPlaylist(req.url, req.paths, req.sort, req.direction, req.orientation, req.currentPath);
             }
         })();
@@ -343,11 +429,18 @@ const App: React.FC = () => {
         writeServerPlaylistSnapshot({
             serverUrl: config.serverUrl,
             selectedServerPaths: config.selectedServerPaths,
+            criteriaSignature: buildCriteriaSignature({
+                serverUrl: config.serverUrl,
+                selectedPaths: config.selectedServerPaths,
+                sort: config.sortMode,
+                direction: config.sortDirection,
+                orientation: config.orientationFilter,
+            }),
             playlist: allImages.map(img => img.id),
             currentIndex,
             updatedAt: Date.now(),
         });
-    }, [config.serverUrl, config.selectedServerPaths, allImages, currentIndex, writeServerPlaylistSnapshot]);
+    }, [buildCriteriaSignature, config.orientationFilter, config.selectedServerPaths, config.serverUrl, config.sortDirection, config.sortMode, allImages, currentIndex, writeServerPlaylistSnapshot]);
 
     // --- Preload Logic ---
     useEffect(() => {
@@ -723,7 +816,7 @@ const App: React.FC = () => {
                     <p className="text-neutral-400 mt-2">The current filter returned no results.</p>
                 </div>
                 <button onClick={() => setShowSettings(true)} className="bg-blue-600 px-6 py-3 rounded-xl font-bold text-white hover:bg-blue-500 transition-colors">Open Settings</button>
-                <SettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} config={config} onConfigChange={setConfig} fileCount={allImages.length}
+                <SettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} config={config} onConfigChange={handleConfigChange} fileCount={allImages.length}
                     onReselectFolder={() => { setAllImages(prev => { releaseServerBlobUrls(prev); return []; }); setShowSettings(false); setNoMatchesFound(false); localStorage.removeItem(STORAGE_KEY); clearServerPlaylistSnapshot(); preloadInProgress.current.clear(); clearPreloadedBlobCache(); }}
                 />
             </div>
@@ -744,7 +837,7 @@ const App: React.FC = () => {
                     <Icons.More className="w-6 h-6" />
                 </button>
             )}
-            <SettingsModal isOpen={showSettings} onClose={() => { setShowSettings(false); setIsPaused(false); resetUITimer(); }} config={config} onConfigChange={setConfig} fileCount={allImages.length}
+            <SettingsModal isOpen={showSettings} onClose={() => { setShowSettings(false); setIsPaused(false); resetUITimer(); }} config={config} onConfigChange={handleConfigChange} fileCount={allImages.length}
                 onReselectFolder={() => { setAllImages(prev => { releaseServerBlobUrls(prev); return []; }); setShowSettings(false); setNoMatchesFound(false); localStorage.removeItem(STORAGE_KEY); clearServerPlaylistSnapshot(); preloadInProgress.current.clear(); clearPreloadedBlobCache(); }}
             />
         </div>

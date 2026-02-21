@@ -63,6 +63,7 @@ class RestorePlaylistRequest(BaseModel):
     """用于前端主动恢复 playlist 的请求模型"""
     playlist: List[str]
     current_index: int = 0
+    criteria: Optional[dict] = None
 
 class RuntimeConfigRequest(BaseModel):
     allow_parent_dir_access: bool
@@ -70,8 +71,9 @@ class RuntimeConfigRequest(BaseModel):
 # --- 全局缓存与会话 ---
 class UserSession:
     """用户会话，存储播放列表用于后续的图片请求判断"""
-    def __init__(self, playlist: List[str]):
+    def __init__(self, playlist: List[str], criteria: Optional[dict] = None):
         self.playlist = playlist
+        self.criteria = criteria
         self.request_count = 0
 
 user_sessions = LRUCache(maxsize=600)
@@ -108,17 +110,22 @@ def init_db():
             CREATE TABLE IF NOT EXISTS playlists (
                 client_ip TEXT PRIMARY KEY,
                 playlist TEXT NOT NULL,
+                criteria_json TEXT,
                 created_at REAL NOT NULL
             )''')
+        try:
+            conn.execute("ALTER TABLE playlists ADD COLUMN criteria_json TEXT")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
         print("📊 数据库表初始化完成 (images, playlists)")
 
-def save_playlist_to_db(client_ip: str, playlist: List[str]):
+def save_playlist_to_db(client_ip: str, playlist: List[str], criteria: Optional[dict] = None):
     """将播放列表保存到数据库"""
     with get_db() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO playlists (client_ip, playlist, created_at) VALUES (?, ?, ?)",
-            (client_ip, json.dumps(playlist), time.time())
+            "INSERT OR REPLACE INTO playlists (client_ip, playlist, criteria_json, created_at) VALUES (?, ?, ?, ?)",
+            (client_ip, json.dumps(playlist), json.dumps(criteria) if criteria is not None else None, time.time())
         )
         conn.commit()
 
@@ -136,6 +143,33 @@ def load_playlist_from_db(client_ip: str) -> Optional[List[str]]:
             except json.JSONDecodeError:
                 return None
     return None
+
+def load_playlist_record_from_db(client_ip: str) -> tuple[Optional[List[str]], Optional[dict]]:
+    """从数据库加载 playlist 及其筛选条件。"""
+    with get_db() as conn:
+        cursor = conn.execute(
+            "SELECT playlist, criteria_json FROM playlists WHERE client_ip = ?",
+            (client_ip,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None, None
+
+        playlist = None
+        criteria = None
+        try:
+            playlist = json.loads(row['playlist'])
+        except json.JSONDecodeError:
+            playlist = None
+
+        criteria_raw = row['criteria_json'] if 'criteria_json' in row.keys() else None
+        if criteria_raw:
+            try:
+                criteria = json.loads(criteria_raw)
+            except json.JSONDecodeError:
+                criteria = None
+
+        return playlist, criteria
 
 def iter_image_files_safe(directory: str):
     """
@@ -725,11 +759,17 @@ async def get_playlist(req: PlaylistRequest, request: Request, background_tasks:
 
     # --- 步骤 4: 更新用户会话并持久化到数据库 ---
     client_ip = request.client.host
-    session = UserSession(playlist=final_paths)
+    criteria = {
+        "sort": req.sort,
+        "direction": req.direction,
+        "orientation": req.orientation,
+        "paths": req_paths,
+    }
+    session = UserSession(playlist=final_paths, criteria=criteria)
     user_sessions[client_ip] = session
     
     # 【核心】持久化播放列表到数据库，确保服务器重启后可恢复
-    save_playlist_to_db(client_ip, final_paths)
+    save_playlist_to_db(client_ip, final_paths, criteria)
     
     if final_paths:
         print("🚀 为新列表立即触发一次预加载...")
@@ -761,11 +801,11 @@ async def restore_playlist(req: RestorePlaylistRequest, request: Request, backgr
         raise HTTPException(status_code=400, detail="No valid paths in playlist")
     
     # 创建/更新 session
-    session = UserSession(playlist=valid_paths)
+    session = UserSession(playlist=valid_paths, criteria=req.criteria)
     user_sessions[client_ip] = session
     
     # 持久化到数据库
-    save_playlist_to_db(client_ip, valid_paths)
+    save_playlist_to_db(client_ip, valid_paths, req.criteria)
     
     # 触发预加载
     current_index = max(0, min(req.current_index, len(valid_paths) - 1))
@@ -826,15 +866,17 @@ async def get_session_playlist(request: Request):
             "source": "memory",
             "playlist_size": len(session.playlist),
             "playlist": session.playlist,
+            "criteria": session.criteria,
         }
 
-    playlist = load_playlist_from_db(client_ip)
+    playlist, criteria = load_playlist_record_from_db(client_ip)
     if playlist:
         return {
             "has_session": True,
             "source": "database",
             "playlist_size": len(playlist),
             "playlist": playlist,
+            "criteria": criteria,
         }
 
     return {
@@ -842,6 +884,7 @@ async def get_session_playlist(request: Request):
         "source": None,
         "playlist_size": 0,
         "playlist": [],
+        "criteria": None,
     }
 
 @app.get("/api/browse")
@@ -908,10 +951,10 @@ async def serve_file_core(path_value: str, request: Request, background_tasks: B
     session: UserSession = user_sessions.get(client_ip)
 
     if session is None:
-        playlist = load_playlist_from_db(client_ip)
+        playlist, criteria = load_playlist_record_from_db(client_ip)
         if playlist:
             print(f"🔄 [Session Recovery] 从数据库恢复 IP {client_ip} 的播放列表 ({len(playlist)} 张图片)")
-            session = UserSession(playlist=playlist)
+            session = UserSession(playlist=playlist, criteria=criteria)
             user_sessions[client_ip] = session
 
             if rel_path in playlist:

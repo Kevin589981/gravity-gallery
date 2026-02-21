@@ -35,8 +35,22 @@ struct AppState {
     root_dir: Arc<PathBuf>,
     allow_parent_dir_access: Arc<RwLock<bool>>,
     external_synced_paths_this_boot: Arc<RwLock<HashSet<String>>>,
-    user_sessions: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    user_sessions: Arc<RwLock<HashMap<String, UserSessionData>>>,
     log_api_file_requests: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PlaylistCriteria {
+    sort: String,
+    direction: String,
+    orientation: String,
+    paths: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct UserSessionData {
+    playlist: Vec<String>,
+    criteria: Option<PlaylistCriteria>,
 }
 
 // --- 数据模型 ---
@@ -58,6 +72,7 @@ struct RestorePlaylistRequest {
     playlist: Vec<String>,
     #[serde(default)]
     current_index: usize,
+    criteria: Option<PlaylistCriteria>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +119,7 @@ struct SessionPlaylistResponse {
     source: Option<String>,
     playlist_size: usize,
     playlist: Vec<String>,
+    criteria: Option<PlaylistCriteria>,
 }
 
 #[derive(sqlx::FromRow, Clone, Debug)]
@@ -365,11 +381,16 @@ async fn init_db(pool: &Pool<Sqlite>) -> Result<()> {
         CREATE TABLE IF NOT EXISTS playlists (
             client_ip TEXT PRIMARY KEY,
             playlist TEXT NOT NULL,
+            criteria_json TEXT,
             created_at REAL NOT NULL
         );"
     )
     .execute(pool)
     .await?;
+
+    let _ = sqlx::query("ALTER TABLE playlists ADD COLUMN criteria_json TEXT")
+        .execute(pool)
+        .await;
     Ok(())
 }
 
@@ -721,11 +742,19 @@ async fn get_playlist(
 
     // 5. 持久化到数据库 (关键功能恢复)
     let ip = connect_info.0.ip().to_string();
+    let criteria = PlaylistCriteria {
+        sort: req.sort.clone(),
+        direction: req.direction.clone(),
+        orientation: req.orientation.clone(),
+        paths: valid_req_paths.clone(),
+    };
+    let criteria_json = serde_json::to_string(&criteria).ok();
     if let Ok(json_playlist) = serde_json::to_string(&final_paths) {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
-        sqlx::query("INSERT OR REPLACE INTO playlists (client_ip, playlist, created_at) VALUES (?, ?, ?)")
+        sqlx::query("INSERT OR REPLACE INTO playlists (client_ip, playlist, criteria_json, created_at) VALUES (?, ?, ?, ?)")
             .bind(&ip)
             .bind(json_playlist)
+            .bind(criteria_json)
             .bind(now)
             .execute(&state.db)
             .await
@@ -734,7 +763,13 @@ async fn get_playlist(
 
     {
         let mut sessions = state.user_sessions.write().await;
-        sessions.insert(ip.clone(), final_paths.clone());
+        sessions.insert(
+            ip.clone(),
+            UserSessionData {
+                playlist: final_paths.clone(),
+                criteria: Some(criteria),
+            },
+        );
     }
 
     Json(final_paths)
@@ -778,11 +813,16 @@ async fn restore_playlist(
 
     // 更新数据库会话
     let ip = connect_info.0.ip().to_string();
+    let criteria_json = req
+        .criteria
+        .as_ref()
+        .and_then(|criteria| serde_json::to_string(criteria).ok());
     if let Ok(json_playlist) = serde_json::to_string(&valid_paths) {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
-        sqlx::query("INSERT OR REPLACE INTO playlists (client_ip, playlist, created_at) VALUES (?, ?, ?)")
+        sqlx::query("INSERT OR REPLACE INTO playlists (client_ip, playlist, criteria_json, created_at) VALUES (?, ?, ?, ?)")
             .bind(&ip)
             .bind(json_playlist)
+            .bind(criteria_json)
             .bind(now)
             .execute(&state.db)
             .await
@@ -791,7 +831,13 @@ async fn restore_playlist(
 
     {
         let mut sessions = state.user_sessions.write().await;
-        sessions.insert(ip.clone(), valid_paths.clone());
+        sessions.insert(
+            ip.clone(),
+            UserSessionData {
+                playlist: valid_paths.clone(),
+                criteria: req.criteria.clone(),
+            },
+        );
     }
 
     let current_index = req.current_index.min(valid_paths.len().saturating_sub(1));
@@ -813,11 +859,11 @@ async fn session_status(
 
     {
         let sessions = state.user_sessions.read().await;
-        if let Some(playlist) = sessions.get(&ip) {
+        if let Some(session) = sessions.get(&ip) {
             return Json(SessionStatusResponse {
                 has_session: true,
                 source: Some("memory".to_string()),
-                playlist_size: playlist.len(),
+                playlist_size: session.playlist.len(),
             });
         }
     }
@@ -850,29 +896,34 @@ async fn session_playlist(
 
     {
         let sessions = state.user_sessions.read().await;
-        if let Some(playlist) = sessions.get(&ip) {
+        if let Some(session) = sessions.get(&ip) {
             return Json(SessionPlaylistResponse {
                 has_session: true,
                 source: Some("memory".to_string()),
-                playlist_size: playlist.len(),
-                playlist: playlist.clone(),
+                playlist_size: session.playlist.len(),
+                playlist: session.playlist.clone(),
+                criteria: session.criteria.clone(),
             });
         }
     }
 
-    let row: Option<(String,)> = sqlx::query_as("SELECT playlist FROM playlists WHERE client_ip = ?")
+    let row: Option<(String, Option<String>)> = sqlx::query_as("SELECT playlist, criteria_json FROM playlists WHERE client_ip = ?")
         .bind(&ip)
         .fetch_optional(&state.db)
         .await
         .unwrap_or(None);
 
-    if let Some((playlist_json,)) = row {
+    if let Some((playlist_json, criteria_json)) = row {
         if let Ok(list) = serde_json::from_str::<Vec<String>>(&playlist_json) {
+            let criteria = criteria_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<PlaylistCriteria>(raw).ok());
             return Json(SessionPlaylistResponse {
                 has_session: true,
                 source: Some("database".to_string()),
                 playlist_size: list.len(),
                 playlist: list,
+                criteria,
             });
         }
     }
@@ -882,6 +933,7 @@ async fn session_playlist(
         source: None,
         playlist_size: 0,
         playlist: Vec::new(),
+        criteria: None,
     })
 }
 
