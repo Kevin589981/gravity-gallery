@@ -11,6 +11,7 @@ export const DEFAULT_CONFIG: AppConfig = {
     sortDirection: SortDirection.Forward, // NEW: Default direction
     orientationFilter: OrientationFilter.Both,
     controlRevealMode: ControlRevealMode.Tap,
+    startFromCurrentOnCriteriaChange: true,
 };
 
 

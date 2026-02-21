@@ -134,6 +134,19 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
                                     Portrait
                                 </button>
                             </div>
+
+                            <div className="flex items-center justify-between px-2 py-3">
+                                <div className="flex flex-col">
+                                    <span className="text-neutral-200 text-sm">Keep current image</span>
+                                    <span className="text-xs text-neutral-500">When filters change, start from current if possible</span>
+                                </div>
+                                <button
+                                    onClick={() => updateConfig('startFromCurrentOnCriteriaChange', !config.startFromCurrentOnCriteriaChange)}
+                                    className={`w-12 h-7 rounded-full transition-colors relative ${config.startFromCurrentOnCriteriaChange ? 'bg-green-600' : 'bg-neutral-700'}`}
+                                >
+                                    <div className={`w-5 h-5 bg-white rounded-full absolute top-1 transition-transform ${config.startFromCurrentOnCriteriaChange ? 'left-6' : 'left-1'}`} />
+                                </button>
+                            </div>
                         </div>
                     </div>
 

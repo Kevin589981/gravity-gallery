@@ -355,6 +355,10 @@ const App: React.FC = () => {
                 const reason: 'auto' | 'user' = userCriteriaChangeRef.current ? 'user' : 'auto';
                 userCriteriaChangeRef.current = false;
 
+                const currentPathForRequest = (reason === 'user' && !config.startFromCurrentOnCriteriaChange)
+                    ? null
+                    : currentImagePath;
+
                 // If a fetch is already in-flight, queue the latest desired fetch instead of skipping.
                 pendingServerFetchRef.current = {
                     url: config.serverUrl,
@@ -362,7 +366,7 @@ const App: React.FC = () => {
                     sort: config.sortMode,
                     direction: config.sortDirection,
                     orientation: config.orientationFilter,
-                    currentPath: currentImagePath,
+                    currentPath: currentPathForRequest,
                     reason,
                 };
 

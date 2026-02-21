@@ -39,6 +39,7 @@ export interface AppConfig {
     sortDirection: SortDirection; // NEW: Direction control
     orientationFilter: OrientationFilter;
     controlRevealMode: ControlRevealMode;
+    startFromCurrentOnCriteriaChange: boolean; // When manual criteria changes trigger a new playlist, start from current image if possible
     serverUrl?: string;
     selectedServerPaths?: string[]; // Folders selected on server
 }
