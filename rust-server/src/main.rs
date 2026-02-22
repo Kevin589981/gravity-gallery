@@ -6,6 +6,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use axum_server::tls_rustls::RustlsConfig;
 use futures::StreamExt;
 use mime_guess::from_path;
@@ -302,7 +304,7 @@ async fn sync_external_path_to_db(pool: &Pool<Sqlite>, root_dir: &Path, rel_path
     }
 
     tx.commit().await?;
-    println!(
+    tracing::info!(
         "🔄 [On-demand External Sync] {} | scanned {} | deleted {}",
         normalized,
         scanned_paths.len(),
@@ -424,7 +426,7 @@ fn process_image_metadata_sync(full_path: &Path, root_dir: &Path) -> Option<Imag
 
 /// 后台扫描任务
 async fn scan_library_task(pool: Pool<Sqlite>, root_dir: Arc<PathBuf>) {
-    println!("🔍 [Background] 开始全量扫描...");
+    tracing::info!("🔍 [Background] 开始全量扫描...");
     let start = std::time::Instant::now();
 
     // 1. 遍历文件系统 (FS)
@@ -470,7 +472,7 @@ async fn scan_library_task(pool: Pool<Sqlite>, root_dir: Arc<PathBuf>) {
 
     // 4. 并发处理元数据读取 (Bounded Parallelism)
     if !to_process.is_empty() {
-        println!("🚀 [Background] 发现 {} 个变动文件，开始处理...", to_process.len());
+        tracing::info!("🚀 [Background] 发现 {} 个变动文件，开始处理...", to_process.len());
         let mut updates = Vec::new();
         
         // 使用 stream 处理并发，避免瞬间开启过多线程
@@ -519,7 +521,7 @@ async fn scan_library_task(pool: Pool<Sqlite>, root_dir: Arc<PathBuf>) {
         }
     }
 
-    println!("✅ [Background] 扫描完成，耗时 {:.2}s，清理 {}", start.elapsed().as_secs_f64(), deleted_count);
+    tracing::info!("✅ [Background] 扫描完成，耗时 {:.2}s，清理 {}", start.elapsed().as_secs_f64(), deleted_count);
 }
 
 // --- Handlers ---
@@ -575,7 +577,7 @@ async fn get_playlist(
 
         if !already_synced {
             if let Err(err) = sync_external_path_to_db(&state.db, root_dir, &ext_path).await {
-                eprintln!("⚠️ External path sync failed for {}: {}", ext_path, err);
+                tracing::error!("⚠️ External path sync failed for {}: {}", ext_path, err);
             }
             let mut guard = state.external_synced_paths_this_boot.write().await;
             guard.insert(ext_path);
@@ -599,7 +601,7 @@ async fn get_playlist(
 
     for missing in missing_paths {
         if let Err(err) = upsert_missing_path_to_db(&state.db, root_dir, &missing).await {
-            eprintln!("⚠️ Missing-path upsert failed for {}: {}", missing, err);
+            tracing::error!("⚠️ Missing-path upsert failed for {}: {}", missing, err);
         }
     }
 
@@ -781,7 +783,7 @@ async fn restore_playlist(
     Json(req): Json<RestorePlaylistRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let original_count = req.playlist.len();
-    println!("🔄 [Restore Playlist] 请求恢复播放列表，原始路径数量: {}", original_count);
+    tracing::info!("🔄 [Restore Playlist] 请求恢复播放列表，原始路径数量: {}", original_count);
     if original_count == 0 {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -992,7 +994,7 @@ async fn serve_file_by_query(
     Query(query): Query<FileQuery>,
 ) -> Response {
     if state.log_api_file_requests {
-        println!("📷 [API /api/file] path={}", query.path);
+        tracing::info!("📷 [API /api/file] path={}", query.path);
     }
     serve_file_core(state, query.path).await
 }
@@ -1132,11 +1134,22 @@ async fn toggle_runtime_config(State(state): State<AppState>) -> Json<serde_json
 
 #[tokio::main]
 async fn main() -> Result<()> {
-        let host = env::var("GALLERY_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
-        let port = env::var("GALLERY_PORT")
-            .ok()
-            .and_then(|v| v.parse::<u16>().ok())
-            .unwrap_or(4860);
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "gallery_server=debug,tower_http=info,axum::rejection=trace".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    // 把原来的 tracing::info! 替换为 tracing 的宏更好，比如：
+    tracing::info!("Starting server setup...");
+
+    let host = env::var("GALLERY_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let port = env::var("GALLERY_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(4860);
 
     // 1. 环境配置
     let root_dir = env::var("GALLERY_ROOT_DIR").map(PathBuf::from).unwrap_or(env::current_dir()?);
@@ -1161,7 +1174,7 @@ async fn main() -> Result<()> {
         log_api_file_requests: env_flag_enabled("GALLERY_LOG_API_FILE_REQUESTS"),
     };
 
-    println!(
+    tracing::info!(
         "📝 API /api/file request logging: {}",
         if app_state.log_api_file_requests { "ON" } else { "OFF" }
     );
@@ -1187,13 +1200,14 @@ async fn main() -> Result<()> {
         // .route("/*file_path", get(serve_file_by_path))
         // --- 修复点结束 ---
         .layer(CorsLayer::permissive())
+        .layer(TraceLayer::new_for_http())
         .with_state(app_state);
 
     // 4. 服务器启动 (Rustls)
     let addr: SocketAddr = format!("{}:{}", host, port)
         .parse()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 4860)));
-    println!("🚀 Rust Gallery Server running on https://{}", addr);
+    tracing::info!("🚀 Rust Gallery Server running on https://{}", addr);
     
     // 加载证书部分省略，逻辑同上... 假设证书存在
     if let (Ok(cert), Ok(key)) = (env::var("GALLERY_SSL_CERT"), env::var("GALLERY_SSL_KEY")) {
@@ -1202,7 +1216,7 @@ async fn main() -> Result<()> {
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else {
-        println!("⚠️  SSL未配置，运行在 HTTP 模式");
+        tracing::info!("⚠️  SSL未配置，运行在 HTTP 模式");
         axum_server::bind(addr)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
