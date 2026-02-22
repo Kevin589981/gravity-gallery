@@ -94,6 +94,9 @@ const App: React.FC = () => {
 
     // 标记“用户手动修改筛选条件（影响播放列表的 criteria）”，用于跳过自动恢复逻辑。
     const userCriteriaChangeRef = useRef(false);
+
+    // 用于“点击 Change 重新选择路径/服务器”这种场景：下一次连接播放应强制生成新列表。
+    const forceNewPlaylistOnNextServerStartRef = useRef(false);
     
     // 用于防止在设置更改时 useEffect 多次触发 fetch
     const fetchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -692,6 +695,36 @@ const App: React.FC = () => {
         }
     };
 
+    const handleReselectSource = useCallback(() => {
+        // Cancel any pending/ongoing server fetch effects.
+        pendingServerFetchRef.current = null;
+        playlistFetchSeqRef.current += 1;
+        setIsLoading(false);
+
+        // Clear UI + caches.
+        preloadScheduleTokenRef.current += 1;
+        preloadInProgress.current.clear();
+        clearPreloadedBlobCache();
+
+        setAllImages(prev => {
+            releaseServerBlobUrls(prev);
+            return [];
+        });
+        setCurrentIndex(0);
+        setNoMatchesFound(false);
+        setShowSettings(false);
+
+        // Stop auto-restore by clearing paths immediately.
+        setConfig(prev => ({ ...prev, selectedServerPaths: undefined }));
+
+        // Clear persisted state/snapshot so user can truly reselect.
+        localStorage.removeItem(STORAGE_KEY);
+        clearServerPlaylistSnapshot();
+
+        // Next time user hits Play from FileBrowser, force new playlist.
+        forceNewPlaylistOnNextServerStartRef.current = true;
+    }, [clearPreloadedBlobCache, clearServerPlaylistSnapshot, releaseServerBlobUrls]);
+
     const handleFolderSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
         if (!e.target.files || e.target.files.length === 0) return;
         setIsLoading(true);
@@ -725,6 +758,10 @@ const App: React.FC = () => {
     };
     
     const handleServerStart = (url: string, paths: string[]) => {
+        if (forceNewPlaylistOnNextServerStartRef.current) {
+            userCriteriaChangeRef.current = true;
+            forceNewPlaylistOnNextServerStartRef.current = false;
+        }
         setConfig(prev => ({ ...prev, serverUrl: url, selectedServerPaths: paths }));
         // Fetch is handled by the debounced config effect.
     };
@@ -821,7 +858,7 @@ const App: React.FC = () => {
                 </div>
                 <button onClick={() => setShowSettings(true)} className="bg-blue-600 px-6 py-3 rounded-xl font-bold text-white hover:bg-blue-500 transition-colors">Open Settings</button>
                 <SettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} config={config} onConfigChange={handleConfigChange} fileCount={allImages.length}
-                    onReselectFolder={() => { setAllImages(prev => { releaseServerBlobUrls(prev); return []; }); setShowSettings(false); setNoMatchesFound(false); localStorage.removeItem(STORAGE_KEY); clearServerPlaylistSnapshot(); preloadInProgress.current.clear(); clearPreloadedBlobCache(); }}
+                    onReselectFolder={handleReselectSource}
                 />
             </div>
         )
@@ -842,7 +879,7 @@ const App: React.FC = () => {
                 </button>
             )}
             <SettingsModal isOpen={showSettings} onClose={() => { setShowSettings(false); setIsPaused(false); resetUITimer(); }} config={config} onConfigChange={handleConfigChange} fileCount={allImages.length}
-                onReselectFolder={() => { setAllImages(prev => { releaseServerBlobUrls(prev); return []; }); setShowSettings(false); setNoMatchesFound(false); localStorage.removeItem(STORAGE_KEY); clearServerPlaylistSnapshot(); preloadInProgress.current.clear(); clearPreloadedBlobCache(); }}
+                onReselectFolder={handleReselectSource}
             />
         </div>
     );
